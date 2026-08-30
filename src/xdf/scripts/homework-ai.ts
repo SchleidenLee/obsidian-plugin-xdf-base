@@ -44,20 +44,14 @@ export const HOMEWORK_AI_SCRIPT = String.raw`module.exports = async (params) => 
         const noteContent = await app.vault.read(file);
 
         // 3. 构造 prompt
-        const messages = [
-            {
-                role: "system",
-                content: "你是一位经验丰富的英语教师，擅长根据课堂笔记出题。"
-            },
-            {
-                role: "user",
-                content: "# 课堂笔记\n" + noteContent + "\n\n# 作业类型\n" + homeworkType + "\n\n# 词汇等级\n" + vocabLevel + "\n\n# 掺入比例\n" + ratio + "%\n\n# 补充考察点\n" + extraPoints + "\n\n请按 markdown 格式输出作业题单。完整的三阶段流水线实现待后续填充。\n"
-            }
-        ];
+        // 注意：ai.prompt 的第一个参数是字符串（作为 user 消息），
+        // system 角色走 settings.systemPrompt，不能传 messages 数组
+        const systemPrompt = "你是一位经验丰富的英语教师，擅长根据课堂笔记出题。";
+        const prompt = "# 课堂笔记\n" + noteContent + "\n\n# 作业类型\n" + homeworkType + "\n\n# 词汇等级\n" + vocabLevel + "\n\n# 掺入比例\n" + ratio + "%\n\n# 补充考察点\n" + extraPoints + "\n\n请按 markdown 格式输出作业题单。完整的三阶段流水线实现待后续填充。\n";
 
-        // 4. 调 AI
-        const result = await quickAddApi.ai.prompt(messages, "deepseek-chat", {
-            systemPrompt: "",
+        // 4. 调 AI（模型在 XDF-Base 设置里统一配置，脚本不关心）
+        const result = await quickAddApi.ai.prompt(prompt, undefined, {
+            systemPrompt,
             modelOptions: { temperature: 0.7 }
         });
 

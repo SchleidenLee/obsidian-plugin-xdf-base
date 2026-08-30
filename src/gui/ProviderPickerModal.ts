@@ -29,7 +29,7 @@ export class ProviderPickerModal extends Modal {
 
   private addHeader(container: HTMLElement) {
     container.createEl("h2", {
-      text: "Add a provider",
+      text: "添加供应商",
       cls: "qa-modal-title",
     });
   }
@@ -60,8 +60,8 @@ export class ProviderPickerModal extends Modal {
 
       let apiKeyRef = "";
       const apiSetting = new Setting(card)
-        .setName("API key")
-        .setDesc("Select a secret from SecretStorage")
+        .setName("API Key")
+        .setDesc("从 SecretStorage 选择或新建")
         .addComponent((el) => new SecretComponent(this.app, el)
           .setValue(apiKeyRef)
           .onChange((value) => {
@@ -71,7 +71,7 @@ export class ProviderPickerModal extends Modal {
       apiSetting.settingEl.addClass("qa-provider-api-setting");
 
       apiSetting.addButton((b) => {
-          b.setButtonText("Connect").setCta().onClick(async () => {
+          b.setButtonText("连接").setCta().onClick(async () => {
             try {
               const selectedSecret = apiKeyRef.trim();
 
@@ -81,7 +81,7 @@ export class ProviderPickerModal extends Modal {
 
                 new URL(preset.endpoint);
               } catch {
-                new Notice(`Invalid endpoint URL for ${preset.name}.`);
+                new Notice(`${preset.name} 的接口地址无效。`);
                 return;
               }
 
@@ -133,7 +133,7 @@ export class ProviderPickerModal extends Modal {
 
               // Import the provider's current models right away — connecting a
               // provider should end with working models, not a manual sync step.
-              b.setButtonText("Connecting...");
+              b.setButtonText("连接中…");
               b.setDisabled(true);
               await this.importInitialModels(provider, preset);
 
@@ -142,22 +142,22 @@ export class ProviderPickerModal extends Modal {
               // a stray second click can't push a duplicate.
               this.close();
             } catch (err) {
-              b.setButtonText("Connect");
+              b.setButtonText("连接");
               b.setDisabled(false);
-              new Notice(`Failed to add provider: ${(err as { message?: string }).message ?? err}`);
+              new Notice(`添加供应商失败：${(err as { message?: string }).message ?? err}`);
             }
           });
         });
     }
 
     new Setting(this.contentEl)
-      .setName("Custom provider")
-      .setDesc("Create any custom endpoint (OpenAI-compatible or otherwise)")
+      .setName("自定义供应商")
+      .setDesc("创建任意自定义接口（OpenAI 兼容或其他）")
       .addButton((b) => {
-        b.setButtonText("Add custom...").onClick(() => {
+        b.setButtonText("添加自定义…").onClick(() => {
           const provider: AIProvider = { id: uniqueProviderId("custom", this.providers), name: "Custom", endpoint: "", apiKey: "", apiKeyRef: "", models: [], modelSource: "providerApi" };
           this.providers.push(provider);
-          new Notice("Custom provider added. Click Edit to configure.");
+          new Notice("已添加自定义供应商，点击「编辑」进行配置。");
           this.close();
         });
       });
@@ -176,18 +176,18 @@ export class ProviderPickerModal extends Modal {
     try {
       await syncProviderModels(this.app, provider);
       new Notice(
-        `${preset.name} connected with ${provider.models.length} models.`,
+        `${preset.name} 已连接，导入 ${provider.models.length} 个模型。`,
       );
     } catch (err) {
       const message = (err as { message?: string }).message ?? String(err);
       if (preset.seedKey) {
         provider.models = cloneModelSeeds(preset.seedKey);
         new Notice(
-          `${preset.name} added with its built-in model list. Live model loading failed: ${message}`,
+          `${preset.name} 已添加（使用内置模型列表）。在线获取模型失败：${message}`,
         );
       } else {
         new Notice(
-          `${preset.name} added, but loading models failed: ${message} Use "Sync now" in the provider's settings to retry.`,
+          `${preset.name} 已添加，但获取模型失败：${message} 可在供应商设置里点「立即同步」重试。`,
         );
       }
     }

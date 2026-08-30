@@ -119,7 +119,8 @@ export const DEFAULT_SETTINGS: QuickAddSettings = {
 	version: "0.0.0",
 	globalVariables: {},
 	onePageInputEnabled: false,
-	disableOnlineFeatures: true,
+	// XDF：脚本默认要调 AI（HomeworkAI / WordListAI），在线功能默认开启
+	disableOnlineFeatures: false,
 	enableUriCallbacks: false,
 	enableRibbonIcon: false,
 	showCaptureNotification: true,
@@ -127,8 +128,11 @@ export const DEFAULT_SETTINGS: QuickAddSettings = {
 	enableTemplatePropertyTypes: false,
 	dateAliases: DEFAULT_DATE_ALIASES,
 	ai: {
-		defaultModel: "Ask me",
-		defaultSystemPrompt: `As an AI assistant within Obsidian, your primary goal is to help users manage their ideas and knowledge more effectively. Format your responses using Markdown syntax. Please use the [[Obsidian]] link format. You can write aliases for the links by writing [[Obsidian|the alias after the pipe symbol]]. To use mathematical notation, use LaTeX syntax. LaTeX syntax for larger equations should be on separate lines, surrounded with double dollar signs ($$). You can also inline math expressions by wrapping it in $ symbols. For example, use $$w_{ij}^{\\text{new}}:=w_{ij}^{\\text{current}}+\\eta\\cdot\\delta_j\\cdot x_{ij}$$ on a separate line, but you can write "($\\eta$ = learning rate, $\\delta_j$ = error term, $x_{ij}$ = input)" inline.`,
+		// XDF：脚本调 ai.prompt() 不传模型时使用此默认模型。
+		// 老师在 设置 → AI → 配置 AI 里可添加 provider 并更换模型。
+		defaultModel: "deepseek-chat",
+		// XDF：脚本自带提示词，全局系统提示词无需预设
+		defaultSystemPrompt: "",
 		promptTemplatesFolderPath: "",
 		showAssistant: true,
 		providers: DefaultProviders,

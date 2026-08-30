@@ -16,7 +16,7 @@ import { Notice } from "obsidian";
 import { DBConnection, DBSync, createDBApi, type XdfDBApi } from "./db";
 import { DBBuilder } from "./db/Builder";
 import { ScriptReleaser } from "./scripts/ScriptReleaser";
-import { ensurePresetChoices } from "./choiceManager";
+import { syncPresetChoices } from "./choiceManager";
 
 export interface RebuildSummary {
     fileCount: number;
@@ -57,18 +57,18 @@ export class XdfBaseExtension {
             new Notice("❌ XDF-Base 脚本释放失败：" + err);
         }
 
-        // 2. 增量补全 Choice
+        // 2. 同步预设 Choice（文件夹分组，覆盖式）
         try {
-            const choiceResult = ensurePresetChoices(
+            const choiceResult = syncPresetChoices(
                 (this.plugin as any).settings?.choices || []
             );
             if (choiceResult.updated) {
                 (this.plugin as any).settings.choices = choiceResult.choices;
                 await (this.plugin as any).saveData((this.plugin as any).settings);
-                console.log(`[XDF-Base] Choice 同步完成：新增 ${choiceResult.added.length}，覆盖 ${choiceResult.replaced.length}`);
+                console.log(`[XDF-Base] Choice 同步完成：新增文件夹 ${choiceResult.added.length}，重建 ${choiceResult.replaced.length}`);
             }
         } catch (err) {
-            console.error("[XDF-Base] Choice 补全失败:", err);
+            console.error("[XDF-Base] Choice 同步失败:", err);
         }
 
         // 3. 启动 vault 事件监听
@@ -148,10 +148,10 @@ export class XdfBaseExtension {
     }
 
     /**
-     * 重新补全 Choice（设置面板调用）
+     * 重新同步预设 Choice（设置面板调用）
      */
     async ensureChoices() {
-        const result = ensurePresetChoices(
+        const result = syncPresetChoices(
             (this.plugin as any).settings?.choices || []
         );
         if (result.updated) {

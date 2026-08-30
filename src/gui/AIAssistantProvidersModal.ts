@@ -68,7 +68,7 @@ export class AIAssistantProvidersModal extends Modal {
 	private display(): void {
 		const modalName = this.selectedProvider
 			? `${this.selectedProvider.name}`
-			: "Providers";
+			: "AI 供应商";
 
 		this.contentEl.createEl("h2", {
 			text: modalName,
@@ -92,10 +92,10 @@ export class AIAssistantProvidersModal extends Modal {
 
 	addProvidersSetting(container: HTMLElement) {
 		new Setting(container)
-			.setName("Providers")
-			.setDesc("Providers for the AI Assistant")
+			.setName("AI 供应商")
+			.setDesc("AI 助手使用的供应商")
             .addButton((button) => {
-                button.setButtonText("Add provider").onClick(async () => {
+                button.setButtonText("添加供应商").onClick(async () => {
                     await new ProviderPickerModal(this.app, this.providers).waitForClose;
                     this.reload();
                 });
@@ -115,7 +115,7 @@ export class AIAssistantProvidersModal extends Modal {
 					button.onClick(async () => {
 						const confirmation = await GenericYesNoPrompt.Prompt(
 							this.app,
-							`Are you sure you want to delete ${provider.name}?`
+							`确定要删除 ${provider.name} 吗？`
 						);
 						if (!confirmation) {
 							return;
@@ -128,7 +128,7 @@ export class AIAssistantProvidersModal extends Modal {
 					button.setIcon("trash" as IconType);
 				})
 					.addButton((button) => {
-						button.setButtonText("Edit").onClick(() => {
+						button.setButtonText("编辑").onClick(() => {
 							this.selectedProvider = provider;
 							this._selectedProviderClone = deepClone(provider);
 
@@ -155,11 +155,11 @@ export class AIAssistantProvidersModal extends Modal {
 	addNameSetting(container: HTMLElement) {
 		const providerId = this.selectedProvider!.id;
 		new Setting(container)
-			.setName("Name")
+			.setName("名称")
 			.setDesc(
 				providerId
-					? `The display name of the provider. Its stable ID is "${providerId}" — use that to qualify models in scripts, e.g. ai.prompt with "${providerId}/model-name".`
-					: "The display name of the provider",
+					? `供应商的显示名称。其稳定 ID 为 "${providerId}"，脚本中可用它限定模型，如 ai.prompt 使用 "${providerId}/模型名"。`
+					: "供应商的显示名称",
 			)
 			.addText((text) => {
 				text.setValue(this.selectedProvider!.name).onChange((value) => {
@@ -170,8 +170,8 @@ export class AIAssistantProvidersModal extends Modal {
 
 	addEndpointSetting(container: HTMLElement) {
 		new Setting(container)
-			.setName("Endpoint")
-			.setDesc("The endpoint for the AI Assistant")
+			.setName("接口地址")
+			.setDesc("供应商的 API 接口地址（从官网复制）")
 			.addText((text) => {
 				text.setValue(this.selectedProvider!.endpoint).onChange(
 					(value) => {
@@ -185,11 +185,11 @@ export class AIAssistantProvidersModal extends Modal {
 		const hasLegacyKey =
 			!!this.selectedProvider?.apiKey && !this.selectedProvider?.apiKeyRef;
 		const description = hasLegacyKey
-			? "Legacy API key detected. Select a SecretStorage entry to migrate."
-			: "Select a secret from SecretStorage";
+			? "检测到旧版明文 API Key，请选择一个 SecretStorage 条目完成迁移。"
+			: "从 SecretStorage 选择或新建 API Key";
 
 		new Setting(container)
-			.setName("API key")
+			.setName("API Key")
 			.setDesc(description)
 			.addComponent((el) =>
 				new SecretComponent(this.app, el)
@@ -204,13 +204,13 @@ export class AIAssistantProvidersModal extends Modal {
 
 	addKindSetting(container: HTMLElement) {
 		new Setting(container)
-			.setName("Provider type")
+			.setName("接口类型")
 			.setDesc(
-				"The request format this provider expects. Auto-detect recognizes the official Anthropic and Gemini endpoints and treats everything else as OpenAI-compatible; pick a type explicitly for a proxy or custom endpoint.",
+				"该供应商期望的请求格式。自动识别可识别 Anthropic 和 Gemini 官方接口，其余一律按 OpenAI 兼容处理；代理或自定义接口请手动指定类型。",
 			)
 			.addDropdown((dropdown) => {
-				dropdown.addOption("", "Auto-detect");
-				dropdown.addOption("openai", "OpenAI-compatible");
+				dropdown.addOption("", "自动识别");
+				dropdown.addOption("openai", "OpenAI 兼容");
 				dropdown.addOption("anthropic", "Anthropic");
 				dropdown.addOption("gemini", "Gemini");
 				dropdown.setValue(this.selectedProvider?.kind ?? "");
@@ -226,19 +226,19 @@ export class AIAssistantProvidersModal extends Modal {
 	addModelSourceSetting(container: HTMLElement) {
 		const provider = this.selectedProvider;
 		new Setting(container)
-			.setName("Model source")
+			.setName("模型来源")
 			.setDesc(
-				"Choose where QuickAdd looks when browsing or syncing models for this provider.",
+				"浏览或同步该供应商的模型列表时，从哪里获取。",
 			)
 			.addDropdown((dropdown) => {
 				dropdown.addOption(
 					"providerApi",
-					"Provider models endpoint (requires API key)",
+					"供应商模型接口（需要 API Key）",
 				);
-				dropdown.addOption("modelsDev", "models.dev directory");
+				dropdown.addOption("modelsDev", "models.dev 目录");
 				dropdown.addOption(
 					"auto",
-					"Automatic (try provider, fallback to models.dev)",
+					"自动（先试供应商接口，失败则用 models.dev）",
 				);
 				const current = provider?.modelSource ?? "providerApi";
 				dropdown.setValue(current);
@@ -256,12 +256,12 @@ export class AIAssistantProvidersModal extends Modal {
 		});
 
         this.selectedProvider!.models.forEach((model, i) => {
-            const metadata = [`Context: ${model.maxTokens.toLocaleString()} tokens`];
+            const metadata = [`上下文：${model.maxTokens.toLocaleString()} tokens`];
             if (model.maxOutputTokens) {
-                metadata.push(`Output: ${model.maxOutputTokens.toLocaleString()} tokens`);
+                metadata.push(`输出上限：${model.maxOutputTokens.toLocaleString()} tokens`);
             }
             if (model.supportsTemperature === false) {
-                metadata.push("Fixed sampling (no temperature)");
+                metadata.push("固定采样（不支持温度参数）");
             }
             new Setting(modelsContainer)
                 .setName(model.name)
@@ -270,7 +270,7 @@ export class AIAssistantProvidersModal extends Modal {
                     button.onClick(async () => {
                         const confirmation = await GenericYesNoPrompt.Prompt(
                             this.app,
-                            `Are you sure you want to delete ${model.name}?`
+                            `确定要删除 ${model.name} 吗？`
                         );
                         if (!confirmation) {
                             return;
@@ -285,19 +285,19 @@ export class AIAssistantProvidersModal extends Modal {
         });
 
         new Setting(modelsContainer)
-            .setName("Add model")
+            .setName("添加模型")
             .addButton((button) => {
-                button.setButtonText("Add model").onClick(async () => {
+                button.setButtonText("手动添加模型").onClick(async () => {
                     let modelName: string;
                     let maxTokens: string;
                     try {
                         modelName = await GenericInputPrompt.Prompt(
                             this.app,
-                            "Model name"
+                            "模型名称（如 deepseek-chat）"
                         );
                         maxTokens = await GenericInputPrompt.Prompt(
                             this.app,
-                            "Max tokens"
+                            "最大上下文 tokens（如 65536）"
                         );
                     } catch {
                         // Cancelling either prompt is a clean no-op.
@@ -306,7 +306,7 @@ export class AIAssistantProvidersModal extends Modal {
 
                     const trimmedName = modelName.trim();
                     if (!trimmedName) {
-                        new Notice("Model name cannot be empty.");
+                        new Notice("模型名称不能为空。");
                         return;
                     }
 
@@ -314,7 +314,7 @@ export class AIAssistantProvidersModal extends Modal {
                     // accept "10abc" as 10. Require a plain positive integer.
                     const normalizedMaxTokens = maxTokens.trim();
                     if (!/^[1-9]\d*$/.test(normalizedMaxTokens)) {
-                        new Notice("Max tokens must be a positive number.");
+                        new Notice("最大上下文必须是正整数。");
                         return;
                     }
                     const parsedMaxTokens = Number(normalizedMaxTokens);
@@ -350,7 +350,7 @@ export class AIAssistantProvidersModal extends Modal {
                             imported
                         );
                     }
-                    new Notice(`Imported ${imported.length} models${mode === "replace" ? " (replaced)" : " (added)"}.`);
+                    new Notice(`已导入 ${imported.length} 个模型${mode === "replace" ? "（已替换）" : "（已添加）"}。`);
                     this.reload();
                 });
                 button.setCta();
@@ -359,10 +359,10 @@ export class AIAssistantProvidersModal extends Modal {
 
 	addAutoSyncSetting(container: HTMLElement) {
 		const sourceDescription = this.describeModelSource(this.selectedProvider);
-		new Setting(container)
-			.setName("Auto-sync models")
+			new Setting(container)
+			.setName("自动同步模型")
 			.setDesc(
-				`Keep this provider's models current automatically: QuickAdd imports new models and refreshed context limits from ${sourceDescription} once a day and when these settings open.`,
+				`自动保持该供应商的模型列表最新：每天一次及打开本设置时，从${sourceDescription}导入新模型和更新的上下文上限。`,
 			)
 			.addToggle((toggle) => {
 				const current = !!this.selectedProvider?.autoSyncModels;
@@ -371,7 +371,7 @@ export class AIAssistantProvidersModal extends Modal {
 				});
 			})
 			.addButton((button) => {
-				button.setButtonText("Sync now").onClick(async () => {
+				button.setButtonText("立即同步").onClick(async () => {
 					try {
 						const { added, updated } = await syncProviderModels(
 							this.app,
@@ -379,13 +379,13 @@ export class AIAssistantProvidersModal extends Modal {
 						);
 						new Notice(
 							added > 0 || updated > 0
-								? `Synced from ${sourceDescription}: ${added} new model(s), ${updated} updated.`
-								: `Synced from ${sourceDescription}: already up to date.`,
+								? `已从${sourceDescription}同步：新增 ${added} 个模型，更新 ${updated} 个。`
+								: `已从${sourceDescription}同步：已是最新。`,
 						);
 						this.reload();
 					} catch (err) {
 						new Notice(
-							`Sync failed: ${(err as { message?: string }).message ?? err}`
+							`同步失败：${(err as { message?: string }).message ?? err}`
 						);
 					}
 				});
@@ -416,7 +416,7 @@ export class AIAssistantProvidersModal extends Modal {
 		});
 
 		const CancelButton = new ButtonComponent(buttonRow);
-		CancelButton.setButtonText("Cancel");
+		CancelButton.setButtonText("取消");
 		CancelButton.setDestructive();
 		CancelButton.onClick(() => {
 			// Cancel always returns to the provider list, discarding edits. We
@@ -428,7 +428,7 @@ export class AIAssistantProvidersModal extends Modal {
 		});
 
 		const SaveButton = new ButtonComponent(buttonRow);
-		SaveButton.setButtonText("Save");
+		SaveButton.setButtonText("保存");
 		SaveButton.setCta();
 		SaveButton.onClick(() => {
 			this.selectedProvider = null;
@@ -440,11 +440,11 @@ export class AIAssistantProvidersModal extends Modal {
 		const mode = provider?.modelSource ?? "providerApi";
 		switch (mode) {
 			case "modelsDev":
-				return "the models.dev directory";
+				return "models.dev 目录";
 			case "auto":
-				return "the provider's models endpoint (falls back to models.dev)";
+				return "供应商模型接口（失败则用 models.dev）";
 			default:
-				return "the provider's models endpoint";
+				return "供应商模型接口";
 		}
 	}
 

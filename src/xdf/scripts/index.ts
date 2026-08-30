@@ -78,7 +78,7 @@ export const PRESET_SCRIPTS: PresetScript[] = [
     },
     {
         id: "wordlist-ai",
-        displayName: "XDF: AI 单词语法整理",
+        displayName: "XDF: 词表工具",
         path: "scripts/WordListAI.js",
         content: WORDLIST_AI_SCRIPT,
         category: "AI"

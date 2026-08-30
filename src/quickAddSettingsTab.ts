@@ -40,6 +40,7 @@ import { createDocsLink, DOCS_URLS, openDocsUrl } from "./docs";
 import { rootChoicesOf } from "./utils/choiceUtils";
 import { getXdfBaseInstance } from "./xdf/XdfBaseExtension";
 import { ScriptReleaser } from "./xdf/scripts/ScriptReleaser";
+import { AIAssistantSettingsModal } from "./gui/AIAssistantSettingsModal";
 
 /** String-named keys of {@link QuickAddSettings} — used to type the declarative
  * `control` keys so a mistyped key is caught at compile time. */
@@ -50,8 +51,7 @@ type SettingsKey = Extract<keyof QuickAddSettings, string>;
  * and by the rendered description (which the row rewrites as the export state
  * changes), so the two can never drift.
  */
-const PACKAGES_DESC =
-	"Bundle or import QuickAdd automations as reusable packages.";
+const PACKAGES_DESC = "将 QuickAdd 自动化配置打包导出或导入，便于复用。";
 
 export class QuickAddSettingsTab extends PluginSettingTab {
 	public plugin: QuickAdd;
@@ -112,21 +112,12 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	}
 
 	override getSettingDefinitions(): SettingDefinitionItem<SettingsKey>[] {
-		const groups: SettingDefinitionGroup<SettingsKey>[] = [
-			this.choicesAndPackagesGroup(),
-			this.choicePickerGroup(),
-			this.inputGroup(),
-			this.templatesGroup(),
-			this.notificationsGroup(),
-			this.globalVariablesGroup(),
+		const groups: SettingDefinitionItem<SettingsKey>[] = [
+			this.choicesGroup(),
 			this.aiGroup(),
 			this.databaseGroup(),
-			this.appearanceGroup(),
+			this.advancedPage(),
 		];
-
-		if (__IS_DEV_BUILD__) {
-			groups.push(this.developerGroup());
-		}
 
 		return groups;
 	}
@@ -156,31 +147,37 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 
 	// ----- group builders -----
 
-	private choicesAndPackagesGroup(): SettingDefinitionGroup<SettingsKey> {
+	private choicesGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Choices & packages",
-			// QuickAdd's power surface is syntax you have to learn ({{VALUE}},
-			// {{DATE}}, capture targets, ...) and until now the manual was reachable
-			// from exactly one place in the whole plugin (issue #1541). A help icon
-			// on the first heading is Obsidian's own idiom for this, and it costs the
-			// page no vertical space, so the choices list stays the focus.
+			heading: "选项",
+			// QuickAdd 的自动化能力有一套要学的语法（{{VALUE}}、{{DATE}}、
+			// capture 目标……），文档入口放在第一个分组标题上。
 			extraButtons: [
 				(button) =>
 					button
 						.setIcon("help-circle")
-						.setTooltip("QuickAdd documentation")
+						.setTooltip("QuickAdd 文档")
 						.onClick(() =>
 							openDocsUrl(DOCS_URLS.gettingStarted, button.extraSettingsEl),
 						),
 			],
 			items: [
 				{
-					name: "Choices",
+					name: "选项列表",
 					render: (setting) => this.renderChoicesView(setting),
 				},
+			],
+		};
+	}
+
+	private packagesGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "打包",
+			items: [
 				{
-					name: "Packages",
+					name: "打包导出 / 导入",
 					desc: PACKAGES_DESC,
 					render: (setting) => this.renderPackages(setting),
 				},
@@ -191,27 +188,24 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private choicePickerGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Choice picker",
+			heading: "选择面板",
 			items: [
 				{
-					name: "Search nested choices",
-					// "Multi" is the internal type id; every other user-facing string
-					// says folder (see src/utils/choiceNoun.ts), and this was the one
-					// place in the whole settings surface that leaked it.
-					desc: "When searching in the choice picker, also match choices nested inside folders and show their path. Note that nested matches can outrank same-level ones. Disable to search only the open level.",
+					name: "搜索文件夹内的选项",
+					desc: "在选择面板搜索时，同时匹配文件夹内嵌套的选项并显示其路径。注意：嵌套匹配可能排在同级匹配之前。关闭后只搜索当前展开的层级。",
 					control: { type: "toggle", key: "searchNestedChoices" },
 				},
 				{
-					name: "“New note from template” in the launcher",
-					desc: "Add a row to Run QuickAdd that lists templates from your configured template folder, so you can create a note from a template without a dedicated Template choice. Only appears when a template folder is configured; the command palette entry works regardless.",
+					name: "「从模板新建笔记」入口",
+					desc: "在 Run QuickAdd 面板里加一行，列出模板文件夹中的模板，无需专门的 Template 选项即可从模板建笔记。仅配置了模板文件夹后显示；命令面板入口始终可用。",
 					control: {
 						type: "dropdown",
 						key: "templateFolderLauncherRow",
 						defaultValue: "bottom",
 						options: {
-							bottom: "Show at the bottom (keeps your top choice first)",
-							top: "Show at the top",
-							off: "Hide",
+							bottom: "显示在底部（不抢占第一个回车位）",
+							top: "显示在顶部",
+							off: "隐藏",
 						},
 					},
 				},
@@ -222,39 +216,37 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private inputGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Input",
+			heading: "输入",
 			items: [
 				{
-					name: "Use multi-line input prompt",
-					desc: "Use multi-line input prompt instead of single-line input prompt. Submit multi-line prompts with Ctrl/Cmd+Enter; Enter inserts a newline.",
+					name: "使用多行输入框",
+					desc: "用多行输入框代替单行。多行用 Ctrl/Cmd+Enter 提交，Enter 插入换行。",
 					control: { type: "toggle", key: "inputPrompt" },
 				},
 				{
-					name: "Persist input prompt drafts",
-					desc: "Keep drafts when closing input prompts so they can be restored on reopen. Drafts are stored only for this session.",
+					name: "保留输入草稿",
+					desc: "关闭输入框时保留草稿，重新打开时恢复。草稿仅保存在当前会话。",
 					control: { type: "toggle", key: "persistInputPromptDrafts" },
 				},
 				{
-					name: "Use editor selection as default Capture value",
-					desc: "When enabled, Capture uses the current editor selection as {{VALUE}} and may skip the prompt. When disabled, Capture always prompts for {{VALUE}}.",
+					name: "Capture 使用编辑器选中文本作为默认值",
+					desc: "启用后，Capture 用当前编辑器选中的文本作为 {{VALUE}}，可能跳过输入提示。关闭后始终提示输入 {{VALUE}}。",
 					control: { type: "toggle", key: "useSelectionAsCaptureValue" },
 				},
 				{
-					name: "One-page input for choices",
-					// The trailing sentence used to read "See One-page Inputs in the
-					// docs." as plain, unlinked prose (issue #1541).
+					name: "单页输入（One-page input）",
 					desc: this.descWithDocsLink(
-						"Collect a choice's inputs in one form before it runs, instead of one prompt at a time. Works with Template and Capture choices, and with Macros whose scripts declare inputs. Template and Capture choices can override this individually. ",
+						"把一个选项的所有输入收集到一张表单里一次性填写，而不是逐条弹出提示。支持 Template / Capture 选项以及声明了输入的宏脚本。 Template 和 Capture 选项可以单独覆盖此设置。 ",
 						DOCS_URLS.onePageInputs,
-						"Learn more about one-page inputs",
+						"了解单页输入",
 					),
 					control: { type: "toggle", key: "onePageInputEnabled" },
 				},
 				{
-					name: "Date aliases",
+					name: "日期别名",
 					desc:
-						"Shortcodes for natural language date parsing. " +
-						"One per line: alias = phrase. Example: tm = tomorrow.",
+						"自然语言日期解析的简称。" +
+						"每行一条：别名 = 短语。示例：tm = tomorrow。",
 					render: (setting) => this.renderDateAliases(setting),
 				},
 			],
@@ -264,19 +256,19 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private templatesGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Templates & properties",
+			heading: "模板与属性",
 			items: [
 				{
-					name: "Template folder paths",
-					desc: "Folders where templates are stored. Used to suggest template files when configuring QuickAdd. Add as many as you like; leave empty to suggest every template file in the vault.",
+					name: "模板文件夹路径",
+					desc: "存放模板的文件夹，配置 QuickAdd 时从中推荐模板文件。可添加多个；留空则推荐全库所有模板文件。",
 					render: (setting) => this.renderTemplateFolderPaths(setting),
 				},
 				{
-					name: "Convert string front matter variables to typed properties (Beta)",
+					name: "将字符串 frontmatter 变量转为类型化属性（Beta）",
 					desc:
-						"List/object values from scripts are always written as proper Obsidian properties (a list becomes a List). " +
-						"This toggle additionally converts string values into typed properties: a comma or bullet-list string becomes a List, " +
-						"\"42\" becomes a Number, \"true\" becomes a Checkbox, etc. Disabled by default; the string conversion is a beta heuristic that may have edge cases.",
+						"脚本返回的列表/对象值始终写成规范的 Obsidian 属性（列表写为 List）。" +
+						"此开关额外把字符串值转为类型化属性：逗号或项目列表字符串转为 List，" +
+						"\"42\" 转为 Number，\"true\" 转为 Checkbox 等。默认关闭；字符串转换是启发式规则，可能存在边缘情况。",
 					control: { type: "toggle", key: "enableTemplatePropertyTypes" },
 				},
 			],
@@ -286,31 +278,30 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private notificationsGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Notifications",
+			heading: "通知",
 			items: [
 				{
-					name: "Announce updates",
-					desc: "Display release notes when a new version is installed. This includes new features, demo videos, and bug fixes.",
+					name: "更新公告",
+					desc: "安装新版本时显示发布说明，包括新功能、演示视频和缺陷修复。",
 					control: {
 						type: "dropdown",
 						key: "announceUpdates",
 						defaultValue: "major",
 						options: {
-							all: "Show updates on each new release",
-							major:
-								"Show updates only on major releases (new features, breaking changes)",
-							none: "Don't show",
+							all: "每个新版本都显示",
+							major: "仅大版本显示（新功能、破坏性变更）",
+							none: "不显示",
 						},
 					},
 				},
 				{
-					name: "Show capture notifications",
-					desc: "Display a notification when content is captured successfully to confirm the operation completed.",
+					name: "Capture 成功通知",
+					desc: "内容捕获成功后显示通知，确认操作已完成。",
 					control: { type: "toggle", key: "showCaptureNotification" },
 				},
 				{
-					name: "Show input cancellation notifications",
-					desc: "Display a notification when an input prompt is cancelled without submitting. Disable this to avoid extra notices when dismissing prompts.",
+					name: "输入取消通知",
+					desc: "输入提示被取消（未提交）时显示通知。不需要可关闭。",
 					control: {
 						type: "toggle",
 						key: "showInputCancellationNotification",
@@ -323,10 +314,10 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private globalVariablesGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Global variables",
+			heading: "全局变量",
 			items: [
 				{
-					name: "Global variables",
+					name: "全局变量",
 					render: (setting) => this.renderGlobalVariablesView(setting),
 				},
 			],
@@ -339,9 +330,41 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			heading: "AI",
 			items: [
 				{
-					name: "Disable AI & online features",
-					desc: "When on, script calls to `quickAddApi.ai.prompt()` are rejected and no AI provider requests are made. Off by default — scripts that use AI expect it to work.",
-					control: { type: "toggle", key: "disableOnlineFeatures" },
+					name: "启用 AI 在线功能",
+					desc: "关闭后，脚本调用 AI 会直接报错。老师日常使用请保持开启。",
+					render: (setting) => {
+						setting.addToggle((toggle) => {
+							toggle.setValue(
+								!settingsStore.getState().disableOnlineFeatures,
+							);
+							toggle.onChange((enabled) =>
+								settingsStore.setState({
+									disableOnlineFeatures: !enabled,
+								}),
+							);
+						});
+					},
+				},
+				{
+					name: "配置 AI 供应商",
+					desc: "添加 AI 供应商（如 DeepSeek）：从官网复制接口地址、填入 API Key、自动获取模型列表并选择默认模型。脚本调用 AI 时使用这里的默认模型。",
+					render: (setting) => {
+						setting.addButton((button) =>
+							button
+								.setButtonText("配置 AI…")
+								.setCta()
+								.onClick(() => {
+									void new AIAssistantSettingsModal(
+										this.app,
+										settingsStore.getState().ai,
+									).waitForClose
+										.then((ai) => {
+											if (ai) settingsStore.setState({ ai });
+										})
+										.catch(() => {});
+								}),
+						);
+					},
 				},
 			],
 		};
@@ -350,16 +373,16 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private databaseGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Database",
+			heading: "数据与脚本",
 			items: [
 				{
-					name: "Database status",
-					desc: "XDF-Base synchronizes a SQLite database (stored at .xdf/xdf.db) with the vault. The schema is not defined yet; once it lands, rebuild will repopulate tables from every markdown file.",
+					name: "数据库状态",
+					desc: "XDF-Base 通过 SQLite 数据库（存于 .xdf/xdf.db）与 vault 保持同步。重建会清空表并全量扫描所有 markdown 文件。",
 					render: (setting) => this.renderDatabasePanel(setting),
 				},
 				{
-					name: "Preset scripts",
-					desc: "XDF-Base ships built-in scripts (e.g. 一对一建档, 班课档案) and releases them to 00.SYSTEM/xdf_base/ on first launch. Re-release recreates any missing script; existing user edits are preserved.",
+					name: "预设脚本",
+					desc: "XDF-Base 内置课程记录脚本，每次启动自动释放到 00.SYSTEM/xdf_base/（内置脚本覆盖更新，用户新建的脚本不受影响）。",
 					render: (setting) => this.renderScriptPanel(setting),
 				},
 			],
@@ -369,11 +392,11 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private appearanceGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Appearance",
+			heading: "外观",
 			items: [
 				{
-					name: "Show icon in sidebar",
-					desc: "Add QuickAdd icon to the sidebar ribbon. Requires a reload.",
+					name: "侧边栏图标",
+					desc: "在侧边栏 ribbon 显示 QuickAdd 图标。需要重载插件生效。",
 					control: { type: "toggle", key: "enableRibbonIcon" },
 				},
 			],
@@ -383,14 +406,38 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private developerGroup(): SettingDefinitionGroup<SettingsKey> {
 		return {
 			type: "group",
-			heading: "Developer",
+			heading: "开发者",
 			items: [
 				{
-					name: "Development information",
-					desc: "Git information for developers.",
+					name: "开发信息",
+					desc: "面向开发者的 Git 信息。",
 					render: (setting) => this.renderDevInfo(setting),
 				},
 			],
+		};
+	}
+
+	/** 老师日常用不到的选项，收进二级页面。 */
+	private advancedPage(): SettingDefinitionItem<SettingsKey> {
+		const items: SettingDefinitionItem<SettingsKey>[] = [
+			this.choicePickerGroup(),
+			this.inputGroup(),
+			this.templatesGroup(),
+			this.notificationsGroup(),
+			this.globalVariablesGroup(),
+			this.packagesGroup(),
+			this.appearanceGroup(),
+		];
+
+		if (__IS_DEV_BUILD__) {
+			items.push(this.developerGroup());
+		}
+
+		return {
+			type: "page",
+			name: "高级设置",
+			desc: "普通使用无需改动，以下选项保持默认即可",
+			items,
 		};
 	}
 
@@ -501,10 +548,10 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 	private packagesDesc(hasNothingToExport: boolean): DocumentFragment {
 		return this.descWithDocsLink(
 			hasNothingToExport
-				? `${PACKAGES_DESC} Export becomes available once you have a choice. `
+				? `${PACKAGES_DESC} 创建至少一个选项后才能导出。`
 				: `${PACKAGES_DESC} `,
 			DOCS_URLS.packages,
-			"Learn more about packages",
+			"了解打包",
 		);
 	}
 
@@ -516,7 +563,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		let exportButton: ButtonComponent | undefined;
 		setting.addButton((button) => {
 			exportButton = button;
-			button.setButtonText("Export package…").onClick(() => {
+			button.setButtonText("导出包…").onClick(() => {
 				const choicesSnapshot = rootChoicesOf(
 					settingsStore.getState().choices,
 				);
@@ -532,10 +579,10 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		// is one of the most useful things a brand-new user can do, so the block as
 		// a whole is not de-emphasised, only the action that cannot work.
 		setting.addButton((button) =>
-			button.setButtonText("Import package…").onClick(() => {
-				new ImportPackageModal(this.app).open();
-			}),
-		);
+		button.setButtonText("导入包…").onClick(() => {
+			new ImportPackageModal(this.app).open();
+		}),
+	);
 
 		// "Export package…" used to be the first concrete action a new user saw
 		// below the "No choices yet" empty state, with nothing to export (issue
@@ -546,7 +593,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			if (!exportButton) return;
 			exportButton.setDisabled(hasNothingToExport);
 			if (hasNothingToExport) {
-				exportButton.setTooltip("Nothing to export yet");
+				exportButton.setTooltip("还没有可导出的选项");
 			} else {
 				// setTooltip("") is unspecified; Obsidian's tooltip is driven by
 				// aria-label, so drop the attribute outright.
@@ -599,7 +646,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		});
 
 		setting.addButton((button) => {
-			button.setButtonText("Reset to defaults").onClick(() => {
+			button.setButtonText("恢复默认").onClick(() => {
 				settingsStore.setState({ dateAliases: DEFAULT_DATE_ALIASES });
 				textAreaRef?.setValue(formatDateAliasLines(DEFAULT_DATE_ALIASES));
 			});
@@ -623,68 +670,68 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		const container = setting.controlEl.createDiv("qa-xdf-database-panel");
 		const statusEl = container.createEl("pre", {
 			cls: "qa-xdf-database-status",
-			text: "Loading…",
+			text: "加载中…",
 		});
 		const buttonRow = container.createDiv("qa-xdf-database-buttons");
 
 		const renderStatus = (): void => {
 			const xdf = getXdfBaseInstance();
 			if (!xdf) {
-				statusEl.setText("(plugin not fully initialized)");
+				statusEl.setText("（插件未完全初始化）");
 				return;
 			}
 			const s = xdf.getDatabaseStatus();
 			const lines = [
-				`Path:        ${s.path}`,
-				`Open:        ${s.isOpen}`,
-				`Dirty:       ${s.isDirty}`,
-				`Tables (${s.tableCount}): ${s.tables.length ? s.tables.join(", ") : "(none)"}`,
+				`路径:   ${s.path}`,
+				`已打开: ${s.isOpen}`,
+				`有改动: ${s.isDirty}`,
+				`表 (${s.tableCount}): ${s.tables.length ? s.tables.join(", ") : "（无）"}`,
 			];
 			statusEl.setText(lines.join("\n"));
 		};
 
 		setting.addButton((button) => {
-			button.setButtonText("Refresh status").onClick(() => renderStatus());
+			button.setButtonText("刷新状态").onClick(() => renderStatus());
 		});
 
 		buttonRow.createEl("button", {
 			cls: "qa-xdf-db-init",
-			text: "Initialize database",
+			text: "初始化数据库",
 		}).addEventListener("click", async () => {
 			const xdf = getXdfBaseInstance();
 			if (!xdf) {
-				new Notice("XDF-Base not initialized yet");
+				new Notice("XDF-Base 尚未初始化");
 				return;
 			}
 			try {
 				await xdf.initDatabase();
-				new Notice("Database initialized");
+				new Notice("数据库已初始化");
 			} catch (err) {
-				new Notice(`Init failed: ${err}`);
+				new Notice(`初始化失败：${err}`);
 			}
 			renderStatus();
 		});
 
 		buttonRow.createEl("button", {
 			cls: "qa-xdf-db-rebuild",
-			text: "Rebuild database",
+			text: "重建数据库",
 		}).addEventListener("click", async () => {
 			const xdf = getXdfBaseInstance();
 			if (!xdf) {
-				new Notice("XDF-Base not initialized yet");
+				new Notice("XDF-Base 尚未初始化");
 				return;
 			}
 			buttonRow.querySelectorAll("button").forEach((b) => {
 				(b as HTMLButtonElement).disabled = true;
 			});
 			try {
-				new Notice("Rebuilding database…");
+				new Notice("正在重建数据库…");
 				const report = await xdf.rebuildDatabase();
 				new Notice(
-					`Rebuild done — ${report.fileCount} files (${report.durationMs}ms)`,
+					`重建完成 — ${report.fileCount} 个文件（${report.durationMs}ms）`,
 				);
 			} catch (err) {
-				new Notice(`Rebuild failed: ${err}`);
+				new Notice(`重建失败：${err}`);
 			} finally {
 				buttonRow.querySelectorAll("button").forEach((b) => {
 					(b as HTMLButtonElement).disabled = false;
@@ -715,7 +762,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		const container = setting.controlEl.createDiv("qa-xdf-scripts-panel");
 		const statusEl = container.createEl("pre", {
 			cls: "qa-xdf-scripts-status",
-			text: "Loading…",
+			text: "加载中…",
 		});
 		const buttonRow = container.createDiv("qa-xdf-scripts-buttons");
 
@@ -724,27 +771,27 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			try {
 				const status = await releaser.getStatus();
 				const lines: string[] = [
-					`System dir:  ${status.systemDir}`,
-					`Installed (${status.installed.length}):`,
+					`系统目录:  ${status.systemDir}`,
+					`已安装 (${status.installed.length}):`,
 					...status.installed.map((p) => `  ✓ ${p}`),
 				];
 				if (status.missing.length > 0) {
 					lines.push(
-						`Missing (${status.missing.length}):`,
+						`缺失 (${status.missing.length}):`,
 						...status.missing.map((p) => `  ✗ ${p}`),
 					);
 				} else {
-					lines.push("Missing: (none)");
+					lines.push("缺失:（无）");
 				}
 				statusEl.setText(lines.join("\n"));
 			} catch (err) {
-				statusEl.setText(`Error: ${err}`);
+				statusEl.setText(`错误：${err}`);
 			}
 		};
 
 		buttonRow.createEl("button", {
 			cls: "qa-xdf-scripts-release",
-			text: "Re-release scripts",
+			text: "重新释放脚本",
 		}).addEventListener("click", async () => {
 			buttonRow.querySelectorAll("button").forEach((b) => {
 				(b as HTMLButtonElement).disabled = true;
@@ -752,15 +799,15 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			try {
 				const xdf = getXdfBaseInstance();
 				if (!xdf) {
-					new Notice("XDF-Base not initialized yet");
+					new Notice("XDF-Base 尚未初始化");
 					return;
 				}
 				const report = await xdf.releaseScripts();
 				new Notice(
-					`Release: created ${report.created.length}, updated ${report.updated.length}, failed ${report.failed.length}`,
+					`释放完成：新建 ${report.created.length}，覆盖 ${report.updated.length}，失败 ${report.failed.length}`,
 				);
 			} catch (err) {
-				new Notice(`Release failed: ${err}`);
+				new Notice(`释放失败：${err}`);
 			} finally {
 				buttonRow.querySelectorAll("button").forEach((b) => {
 					(b as HTMLButtonElement).disabled = false;
@@ -771,7 +818,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 
 		buttonRow.createEl("button", {
 			cls: "qa-xdf-scripts-choices",
-			text: "Ensure Choices",
+			text: "同步预设 Choice",
 		}).addEventListener("click", async () => {
 			buttonRow.querySelectorAll("button").forEach((b) => {
 				(b as HTMLButtonElement).disabled = true;
@@ -779,17 +826,17 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			try {
 				const xdf = getXdfBaseInstance();
 				if (!xdf) {
-					new Notice("XDF-Base not initialized yet");
+					new Notice("XDF-Base 尚未初始化");
 					return;
 				}
 				const result = await xdf.ensureChoices();
 				if (result.updated) {
-					new Notice(`Added ${result.added.length} missing choice(s)`);
+					new Notice(`同步完成：新增文件夹 ${result.added.length}，重建 ${result.replaced.length}`);
 				} else {
-					new Notice("All preset choices are present");
+					new Notice("所有预设文件夹已就位");
 				}
 			} catch (err) {
-				new Notice(`Ensure failed: ${err}`);
+				new Notice(`同步失败：${err}`);
 			} finally {
 				buttonRow.querySelectorAll("button").forEach((b) => {
 					(b as HTMLButtonElement).disabled = false;

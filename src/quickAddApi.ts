@@ -506,7 +506,7 @@ export class QuickAddApi {
 			ai: {
 				prompt: async (
 					prompt: string,
-					model: ScriptModelInput,
+					model?: ScriptModelInput,
 					settings?: Partial<{
 						variableName: string;
 						shouldAssignVariables: boolean;
@@ -532,8 +532,15 @@ export class QuickAddApi {
 						choiceExecutor,
 					).format;
 
+					// 脚本未指定模型 → 用设置里的默认模型；
+					// "Ask me" 对脚本没有意义（无人值守调用），直接报配置错误。
+					if (!model && AISettings.defaultModel === "Ask me") {
+						throw new Error(
+							"脚本未指定模型且默认模型未配置（Ask me）。请在 设置 → AI → 配置 AI 中选择默认模型。",
+						);
+					}
 					const { model: _model, provider: modelProvider } =
-						resolveModelInputOrThrow(model);
+						resolveModelInputOrThrow(model ?? AISettings.defaultModel);
 
 					const apiKey = await resolveProviderApiKey(app, modelProvider);
 
