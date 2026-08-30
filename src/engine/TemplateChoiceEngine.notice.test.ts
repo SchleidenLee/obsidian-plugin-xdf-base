@@ -1,0 +1,1141 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../quickAddSettingsTab", () => {
+	const defaultSettings = {
+		choices: [],
+		inputPrompt: "single-line",
+		devMode: false,
+		templateFolderPaths: [],
+		useSelectionAsCaptureValue: true,
+		announceUpdates: "major",
+		version: "0.0.0",
+		globalVariables: {},
+		onePageInputEnabled: false,
+		disableOnlineFeatures: true,
+		enableRibbonIcon: false,
+		showCaptureNotification: true,
+		showInputCancellationNotification: true,
+		enableTemplatePropertyTypes: false,
+		ai: {
+			defaultModel: "Ask me",
+			defaultSystemPrompt: "",
+			promptTemplatesFolderPath: "",
+			showAssistant: true,
+			providers: [],
+		},
+		migrations: {
+			migrateToMacroIDFromEmbeddedMacro: true,
+			useQuickAddTemplateFolder: false,
+			incrementFileNameSettingMoveToDefaultBehavior: false,
+			consolidateFileExistsBehavior: false,
+			mutualExclusionInsertAfterAndWriteToBottomOfFile: false,
+			setVersionAfterUpdateModalRelease: false,
+			addDefaultAIProviders: false,
+			removeMacroIndirection: false,
+			migrateFileOpeningSettings: false,
+			backfillFileOpeningDefaults: false,
+		},
+	};
+
+	return {
+		DEFAULT_SETTINGS: defaultSettings,
+		QuickAddSettingsTab: class {},
+	};
+});
+
+const {
+	copyFileLinkToClipboardMock,
+	appendFileLinkToDestinationFileMock,
+	getAppendLinkDestinationFileMock,
+	formatFileNameMock,
+	formatFileContentMock,
+} = vi.hoisted(() => {
+	const copyFileLink = vi.fn();
+	const appendFileLink = vi.fn();
+	const getDestinationFile = vi.fn();
+	const formatName =
+		vi.fn<(format: string, prompt: string) => Promise<string>>();
+	const formatContent = vi
+		.fn<(...args: unknown[]) => Promise<string>>()
+		.mockResolvedValue("");
+
+	return {
+		copyFileLinkToClipboardMock: copyFileLink,
+		appendFileLinkToDestinationFileMock: appendFileLink,
+		getAppendLinkDestinationFileMock: getDestinationFile,
+		formatFileNameMock: formatName,
+		formatFileContentMock: formatContent,
+	};
+});
+
+vi.mock("../formatters/completeFormatter", () => {
+	class CompleteFormatterMock {
+		constructor() {}
+		setLinkToCurrentFileBehavior() {}
+		setTitle() {}
+		setPromptRunContext() {}
+		setTargetFolderPath() {}
+		async formatFileName(format: string, prompt: string) {
+			return formatFileNameMock(format, prompt);
+		}
+		async formatFileContent(...args: unknown[]) {
+			return await formatFileContentMock(...args);
+		}
+		async formatTemplateFilePath(input: string) {
+			return input;
+		}
+		async withTemplatePropertyCollection<T>(work: () => Promise<T>) {
+			return await work();
+		}
+		async withPromptScope<T>(
+			_scope: string,
+			_input: string,
+			work: () => Promise<T>,
+		) {
+			return await work();
+		}
+		getAndClearTemplatePropertyVars() {
+			return new Map<string, unknown>();
+		}
+	}
+
+	return {
+		CompleteFormatter: CompleteFormatterMock,
+		formatFileNameMock,
+		formatFileContentMock,
+	};
+});
+
+vi.mock("../utils/fileLinks", () => ({
+	appendFileLinkToDestinationFile: appendFileLinkToDestinationFileMock,
+	copyFileLinkToClipboard: copyFileLinkToClipboardMock,
+	getAppendLinkDestinationFile: getAppendLinkDestinationFileMock,
+}));
+
+vi.mock("../utilityObsidian", () => ({
+	getTemplater: vi.fn(() => ({})),
+	overwriteTemplaterOnce: vi.fn(),
+	getAllFolderPathsInVault: vi.fn(() => []),
+	insertFileLinkToActiveView: vi.fn(),
+	openExistingFileTab: vi.fn(() => null),
+	openFile: vi.fn(),
+}));
+
+vi.mock("../gui/GenericSuggester/genericSuggester", () => ({
+	default: {
+		Suggest: vi.fn(),
+	},
+}));
+
+vi.mock("../main", () => ({
+	default: class QuickAddMock {},
+}));
+
+vi.mock("obsidian-dataview", () => ({
+	getAPI: vi.fn(),
+}));
+
+import { TFile, TFolder, type App } from "obsidian";
+import { Notice } from "obsidian";
+import { TemplateChoiceEngine } from "./TemplateChoiceEngine";
+import type { IChoiceExecutor } from "../IChoiceExecutor";
+import type ITemplateChoice from "../types/choices/ITemplateChoice";
+import { MacroAbortError } from "../errors/MacroAbortError";
+import { UserCancelError } from "../errors/UserCancelError";
+import { settingsStore } from "../settingsStore";
+import { InputPromptDraftStore } from "../utils/InputPromptDraftStore";
+import { insertFileLinkToActiveView } from "../utilityObsidian";
+
+const defaultSettingsState = structuredClone(settingsStore.getState());
+
+type NoticeTestClass = typeof Notice & {
+	instances: Array<{ message: string; timeout?: number }>;
+};
+
+const noticeClass = Notice as unknown as NoticeTestClass;
+
+const createTemplateChoice = (): ITemplateChoice => ({
+	name: "Test Template Choice",
+	id: "choice-id",
+	type: "Template",
+	command: false,
+	templatePath: "Templates/Test.md",
+	folder: {
+		enabled: false,
+		folders: [],
+		chooseWhenCreatingNote: false,
+		createInSameFolderAsActiveFile: false,
+		chooseFromSubfolders: false,
+	},
+	fileNameFormat: { enabled: false, format: "{{VALUE}}" },
+	appendLink: false,
+	openFile: false,
+	fileOpening: {
+		location: "tab",
+		direction: "vertical",
+		mode: "source",
+		focus: false,
+	},
+	fileExistsBehavior: { kind: "prompt" },
+});
+
+const createEngine = (
+	abortMessage: string,
+	options: { throwDuringFileName?: boolean; stubTemplateContent?: boolean } = {},
+) => {
+	const app = {
+		workspace: {
+			getActiveFile: vi.fn(() => null),
+		},
+		fileManager: {
+			getNewFileParent: vi.fn(() => ({ path: "" })),
+		},
+		vault: {
+			getRoot: vi.fn(() => ({ path: "" })),
+			adapter: {
+				exists: vi.fn(async () => false),
+			},
+			getAbstractFileByPath: vi.fn(),
+			getFiles: vi.fn(() => []),
+			createFolder: vi.fn(),
+			create: vi.fn(),
+			modify: vi.fn(),
+		},
+	} as unknown as App;
+
+	const plugin = { settings: settingsStore.getState() } as any;
+	const choiceExecutor: IChoiceExecutor = {
+		execute: vi.fn(),
+		variables: new Map<string, unknown>(),
+		signalAbort: vi.fn(),
+		consumeAbortSignal: vi.fn(),
+	};
+
+	const engine = new TemplateChoiceEngine(
+		app,
+		plugin,
+		createTemplateChoice(),
+		choiceExecutor,
+	);
+
+	if (options.stubTemplateContent) {
+		(
+			engine as unknown as {
+				getTemplateContent: () => Promise<string>;
+			}
+		).getTemplateContent = vi.fn().mockResolvedValue("stub template");
+	}
+
+	if (options.throwDuringFileName !== false) {
+		formatFileNameMock.mockImplementation(async () => {
+			// A genuine user prompt-dismissal surfaces as UserCancelError in production
+			// (the formatter converts the cancellation); other aborts stay plain.
+			throw abortMessage.toLowerCase().includes("cancelled by user")
+				? new UserCancelError(abortMessage)
+				: new MacroAbortError(abortMessage);
+		});
+	} else {
+		formatFileNameMock.mockResolvedValue("Test Template");
+	}
+
+	return { engine, choiceExecutor, app };
+};
+
+describe("TemplateChoiceEngine cancellation notices", () => {
+	beforeEach(() => {
+		settingsStore.setState(structuredClone(defaultSettingsState));
+		noticeClass.instances.length = 0;
+		InputPromptDraftStore.getInstance().clearAll();
+		appendFileLinkToDestinationFileMock.mockReset();
+		appendFileLinkToDestinationFileMock.mockResolvedValue(true);
+		copyFileLinkToClipboardMock.mockReset();
+		copyFileLinkToClipboardMock.mockResolvedValue(true);
+		getAppendLinkDestinationFileMock.mockReset();
+		getAppendLinkDestinationFileMock.mockReturnValue(null);
+		vi.mocked(insertFileLinkToActiveView).mockReset();
+		formatFileNameMock.mockReset();
+		formatFileContentMock.mockReset();
+		formatFileContentMock.mockResolvedValue("");
+	});
+
+	it("shows a cancellation notice when the setting is enabled", async () => {
+		settingsStore.setState({
+			...settingsStore.getState(),
+			showInputCancellationNotification: true,
+		});
+		const { engine } = createEngine("Input cancelled by user");
+
+		await engine.run();
+
+		expect(noticeClass.instances).toHaveLength(1);
+		expect(noticeClass.instances[0]?.message).toContain(
+			"Template execution aborted: Input cancelled by user",
+		);
+	});
+
+	it("suppresses cancellation notices when the setting is disabled", async () => {
+		settingsStore.setState({
+			...settingsStore.getState(),
+			showInputCancellationNotification: false,
+		});
+
+		const { engine } = createEngine("Input cancelled by user");
+
+		await engine.run();
+
+		expect(noticeClass.instances).toHaveLength(0);
+	});
+
+	it("still shows notices for other abort reasons", async () => {
+		settingsStore.setState({
+			...settingsStore.getState(),
+			showInputCancellationNotification: false,
+		});
+
+		const { engine } = createEngine("Missing template");
+
+		await engine.run();
+
+		expect(noticeClass.instances).toHaveLength(1);
+		expect(noticeClass.instances[0]?.message).toContain(
+			"Template execution aborted: Missing template",
+		);
+	});
+
+	it("signals abort back to the choice executor", async () => {
+		const { engine, choiceExecutor } = createEngine("Input cancelled by user");
+
+		await engine.run();
+
+		expect(choiceExecutor.signalAbort).toHaveBeenCalledTimes(1);
+		const [[error]] = (choiceExecutor.signalAbort as ReturnType<typeof vi.fn>).mock.calls;
+		expect(error).toBeInstanceOf(MacroAbortError);
+	});
+
+	it("signals abort when template content formatting is cancelled", async () => {
+		const { engine, choiceExecutor } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		formatFileContentMock.mockRejectedValueOnce(
+			new UserCancelError("Input cancelled by user"),
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.signalAbort).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves submitted prompt drafts when a non-abort template failure is reported", async () => {
+		const store = InputPromptDraftStore.getInstance();
+		const draftKey = store.makeKey({
+			kind: "single",
+			header: "Test Template Choice",
+			placeholder: "",
+		});
+		const { engine } = createEngine("ignored");
+		formatFileNameMock.mockRejectedValueOnce(new Error("Disk full"));
+
+		store.beginExecutionScope();
+		store.handleSubmittedDraft(draftKey, "Submitted template name");
+
+		await engine.run();
+		store.commitExecutionScope();
+
+		expect(store.get(draftKey)).toBe("Submitted template name");
+	});
+
+	it("preserves submitted prompt drafts when an existing target cannot be resolved", async () => {
+		const store = InputPromptDraftStore.getInstance();
+		const draftKey = store.makeKey({
+			kind: "single",
+			header: "Test Template Choice",
+			placeholder: "",
+		});
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+
+		engine.choice.fileExistsBehavior = { kind: "apply", mode: "overwrite" };
+		(app.vault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(
+			true,
+		);
+
+		store.beginExecutionScope();
+		store.handleSubmittedDraft(draftKey, "Submitted template name");
+
+		await engine.run();
+		store.commitExecutionScope();
+
+		expect(store.get(draftKey)).toBe("Submitted template name");
+	});
+
+	it("preserves submitted prompt drafts when file-exists handling returns no file", async () => {
+		const store = InputPromptDraftStore.getInstance();
+		const draftKey = store.makeKey({
+			kind: "single",
+			header: "Test Template Choice",
+			placeholder: "",
+		});
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+		const existingFile = new TFile();
+		existingFile.path = "Test Template.md";
+		existingFile.name = "Test Template.md";
+		existingFile.extension = "md";
+		existingFile.basename = "Test Template";
+
+		engine.choice.fileExistsBehavior = { kind: "apply", mode: "overwrite" };
+		(app.vault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(
+			true,
+		);
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			existingFile,
+		);
+		vi.spyOn(
+			engine as unknown as {
+				overwriteFileWithTemplate: (
+					file: TFile,
+					templatePath: string,
+				) => Promise<TFile | null>;
+			},
+			"overwriteFileWithTemplate",
+		).mockResolvedValue(null);
+
+		store.beginExecutionScope();
+		store.handleSubmittedDraft(draftKey, "Submitted template name");
+
+		await engine.run();
+		store.commitExecutionScope();
+
+		expect(store.get(draftKey)).toBe("Submitted template name");
+	});
+
+	it("preserves submitted prompt drafts when template file creation returns null", async () => {
+		const store = InputPromptDraftStore.getInstance();
+		const draftKey = store.makeKey({
+			kind: "single",
+			header: "Test Template Choice",
+			placeholder: "",
+		});
+		const { engine } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(null);
+
+		store.beginExecutionScope();
+		store.handleSubmittedDraft(draftKey, "Submitted template name");
+
+		await engine.run();
+		store.commitExecutionScope();
+
+		expect(store.get(draftKey)).toBe("Submitted template name");
+	});
+
+		it("copies the created file link without requiring append-link insertion", async () => {
+			const { engine } = createEngine("ignored", {
+				throwDuringFileName: false,
+		});
+		const createdFile = new TFile();
+		createdFile.path = "Test Template.md";
+		createdFile.name = "Test Template.md";
+		createdFile.extension = "md";
+		createdFile.basename = "Test Template";
+
+		engine.choice.copyLinkToClipboard = true;
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(createdFile);
+
+		await engine.run();
+
+			expect(copyFileLinkToClipboardMock).toHaveBeenCalledWith(createdFile);
+		});
+
+		it("appends the created file link to a specified destination without an active editor", async () => {
+			const { engine, app } = createEngine("ignored", {
+				throwDuringFileName: false,
+			});
+			const createdFile = new TFile();
+			createdFile.path = "Test Template.md";
+			createdFile.name = "Test Template.md";
+			createdFile.extension = "md";
+			createdFile.basename = "Test Template";
+			const destinationFile = new TFile();
+			destinationFile.path = "Indexes/MOC.md";
+			destinationFile.name = "MOC.md";
+			destinationFile.extension = "md";
+			destinationFile.basename = "MOC";
+
+			engine.choice.appendLink = {
+				enabled: true,
+				placement: "replaceSelection",
+				requireActiveFile: true,
+				linkType: "embed",
+				destination: { type: "specifiedFile", path: "Indexes/MOC.md" },
+			};
+			getAppendLinkDestinationFileMock.mockReturnValue(destinationFile);
+			(
+				engine as unknown as {
+					createFileWithTemplate: () => Promise<TFile | null>;
+				}
+			).createFileWithTemplate = vi.fn().mockResolvedValue(createdFile);
+
+			await engine.run();
+
+			expect(appendFileLinkToDestinationFileMock).toHaveBeenCalledWith(
+				app,
+				createdFile,
+				expect.objectContaining({
+					destination: { type: "specifiedFile", path: "Indexes/MOC.md" },
+					linkType: "link",
+				}),
+			);
+		});
+
+		it("does not create the template note when a specified append-link destination is missing", async () => {
+			const { engine } = createEngine("ignored", {
+				throwDuringFileName: false,
+			});
+			const createFileWithTemplate = vi.fn();
+
+			engine.choice.appendLink = {
+				enabled: true,
+				placement: "newLine",
+				requireActiveFile: false,
+				destination: { type: "specifiedFile", path: "Indexes/Missing.md" },
+			};
+			(
+				engine as unknown as {
+					createFileWithTemplate: () => Promise<TFile | null>;
+				}
+			).createFileWithTemplate = createFileWithTemplate;
+
+			await engine.run();
+
+			expect(createFileWithTemplate).not.toHaveBeenCalled();
+			expect(appendFileLinkToDestinationFileMock).not.toHaveBeenCalled();
+		});
+
+		it("keeps template execution successful when clipboard copying reports failure", async () => {
+			const { engine, choiceExecutor } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+		const createdFile = new TFile();
+		createdFile.path = "Test Template.md";
+		createdFile.name = "Test Template.md";
+		createdFile.extension = "md";
+		createdFile.basename = "Test Template";
+
+		engine.choice.copyLinkToClipboard = true;
+		choiceExecutor.recordExecutionResult = vi.fn();
+		copyFileLinkToClipboardMock.mockResolvedValue(false);
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(createdFile);
+
+		await engine.run();
+
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "success",
+			file: createdFile,
+			effect: "created",
+		});
+	});
+
+	/**
+	 * #1603. A genuine failure (a missing template file, a vault error) reported a
+	 * desktop notice and recorded nothing, so `executeWithOutcome` produced a
+	 * reason-less error and the CLI replaced it with "Choice execution failed; no file
+	 * was created." - on the interactive path, for a client that is the whole reason
+	 * nobody is watching the desktop.
+	 */
+	it("records the real failure message so a headless caller learns the cause", async () => {
+		const { engine, choiceExecutor } = createEngine("unused", {
+			throwDuringFileName: false,
+		});
+		choiceExecutor.recordExecutionResult = vi.fn();
+		formatFileNameMock.mockRejectedValue(
+			new Error('Template file not found at path "templates/x.md".'),
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "error",
+			reason: 'Template file not found at path "templates/x.md".',
+		});
+	});
+
+	// A failure exit that is not a throw used to record nothing at all, which is the
+	// same reason-less outcome reached without any exception.
+	it("records a reason when the file could not be created", async () => {
+		const { engine, choiceExecutor } = createEngine("unused", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		choiceExecutor.recordExecutionResult = vi.fn();
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(null);
+
+		await engine.run();
+
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "error",
+			reason: expect.stringContaining("Could not create file"),
+		});
+	});
+
+	// The most actionable of the report-and-return-null exits - it names the fix - and it
+	// was the last one still handing a headless caller "Could not resolve file exists
+	// behavior".
+	it("records why a template cannot be appended to a canvas file", async () => {
+		const { engine, choiceExecutor, app } = createEngine("unused", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		choiceExecutor.recordExecutionResult = vi.fn();
+		const canvas = new TFile();
+		canvas.path = "Board.canvas";
+		canvas.extension = "canvas";
+		canvas.basename = "Board";
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			canvas,
+		);
+		(app.vault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+		engine.choice.fileExistsBehavior = { kind: "apply", mode: "appendTop" };
+
+		await engine.run();
+
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "error",
+			reason: expect.stringContaining('Use the "Overwrite" file-exists option'),
+		});
+	});
+
+	it("keeps template execution successful when clipboard copying throws", async () => {
+		const store = InputPromptDraftStore.getInstance();
+		const draftKey = store.makeKey({
+			kind: "single",
+			header: "Test Template Choice",
+			placeholder: "",
+		});
+		const { engine, choiceExecutor } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+		const createdFile = new TFile();
+		createdFile.path = "Test Template.md";
+		createdFile.name = "Test Template.md";
+		createdFile.extension = "md";
+		createdFile.basename = "Test Template";
+
+		engine.choice.copyLinkToClipboard = true;
+		choiceExecutor.recordExecutionResult = vi.fn();
+		copyFileLinkToClipboardMock.mockRejectedValue(new Error("clipboard denied"));
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(createdFile);
+
+		store.beginExecutionScope();
+		store.handleSubmittedDraft(draftKey, "Submitted template name");
+
+		await engine.run();
+		store.commitExecutionScope();
+
+		expect(copyFileLinkToClipboardMock).toHaveBeenCalledWith(createdFile);
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "success",
+			file: createdFile,
+			effect: "created",
+		});
+		expect(store.get(draftKey)).toBeUndefined();
+	});
+
+	it("keeps template execution successful when configured frontmatter link insertion fails after creation", async () => {
+		const { engine, choiceExecutor, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+		});
+		const createdFile = new TFile();
+		createdFile.path = "Test Template.md";
+		createdFile.name = "Test Template.md";
+		createdFile.extension = "md";
+		createdFile.basename = "Test Template";
+
+		engine.choice.appendLink = {
+			enabled: true,
+			placement: "inFrontmatter",
+			requireActiveFile: true,
+			linkType: "link",
+			frontmatterProperty: "related",
+			frontmatterHandling: "error",
+		};
+		choiceExecutor.recordExecutionResult = vi.fn();
+		(
+			engine as unknown as {
+				createFileWithTemplate: () => Promise<TFile | null>;
+			}
+		).createFileWithTemplate = vi.fn().mockResolvedValue(createdFile);
+		vi.mocked(insertFileLinkToActiveView).mockRejectedValueOnce(
+			new Error("frontmatter property is missing"),
+		);
+
+		await engine.run();
+
+		expect(insertFileLinkToActiveView).toHaveBeenCalledWith(
+			app,
+			createdFile,
+			expect.objectContaining({
+				...(engine.choice.appendLink as object),
+				destination: { type: "activeFile" },
+			}),
+		);
+		expect(choiceExecutor.recordExecutionResult).toHaveBeenCalledWith({
+			status: "success",
+			file: createdFile,
+			effect: "created",
+		});
+	});
+});
+
+describe("TemplateChoiceEngine file casing resolution", () => {
+	beforeEach(() => {
+		settingsStore.setState(structuredClone(defaultSettingsState));
+		formatFileNameMock.mockReset();
+		formatFileContentMock.mockReset();
+		formatFileContentMock.mockResolvedValue("");
+	});
+
+	it("overwrites existing files when the path casing differs", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+
+		const existingFile = new TFile();
+		existingFile.path = "Bug report.md";
+		existingFile.name = "Bug report.md";
+		existingFile.extension = "md";
+		existingFile.basename = "Bug report";
+
+		engine.choice.fileExistsBehavior = { kind: "apply", mode: "overwrite" };
+		formatFileNameMock.mockResolvedValueOnce("Bug Report");
+
+		(app.vault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(
+			true,
+		);
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			null,
+		);
+		(app.vault.getFiles as ReturnType<typeof vi.fn>).mockReturnValue([
+			existingFile,
+		]);
+
+		const overwriteSpy = vi
+			.spyOn(
+				engine as unknown as {
+					overwriteFileWithTemplate: (
+						file: TFile,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"overwriteFileWithTemplate",
+			)
+			.mockResolvedValue(existingFile);
+
+		await engine.run();
+
+		expect(overwriteSpy).toHaveBeenCalledWith(
+			existingFile,
+			engine.choice.templatePath,
+		);
+	});
+
+	it("supports existing .base files for overwrite mode", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+
+		const existingFile = new TFile();
+		existingFile.path = "Board.base";
+		existingFile.name = "Board.base";
+		existingFile.extension = "base";
+		existingFile.basename = "Board";
+
+		engine.choice.templatePath = "Templates/Board.base";
+		engine.choice.fileExistsBehavior = { kind: "apply", mode: "overwrite" };
+		formatFileNameMock.mockResolvedValueOnce("Board");
+
+		(app.vault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(
+			true,
+		);
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			existingFile,
+		);
+
+		const overwriteSpy = vi
+			.spyOn(
+				engine as unknown as {
+					overwriteFileWithTemplate: (
+						file: TFile,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"overwriteFileWithTemplate",
+			)
+			.mockResolvedValue(existingFile);
+
+		await engine.run();
+
+		expect(overwriteSpy).toHaveBeenCalledWith(
+			existingFile,
+			"Templates/Board.base",
+		);
+	});
+});
+
+describe("TemplateChoiceEngine destination path resolution", () => {
+	beforeEach(() => {
+		settingsStore.setState(structuredClone(defaultSettingsState));
+		formatFileNameMock.mockReset();
+		formatFileContentMock.mockReset();
+		formatFileContentMock.mockResolvedValue("");
+	});
+
+	it("treats deep slash-separated filename formats as vault-relative paths", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce(
+			"03_Aufgabenmanagement/ToDos/Issue1116",
+		);
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "03_Aufgabenmanagement/ToDos/W-Tanso",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockImplementation(
+			(path: string) => {
+				if (path === "03_Aufgabenmanagement") {
+					const folder = new TFolder();
+					folder.path = "03_Aufgabenmanagement";
+					folder.name = "03_Aufgabenmanagement";
+					return folder;
+				}
+				return null;
+			},
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"03_Aufgabenmanagement/ToDos/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("treats leading-slash filename formats as vault-relative paths", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce("/Projects/Issue1116");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "03_Aufgabenmanagement/ToDos/W-Tanso",
+		});
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"Projects/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("does not drop default-folder prefix after duplicate-prefix stripping", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce("projects/docs/readme");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "projects",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			null,
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"projects/docs/readme.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("keeps Obsidian default location behavior for plain file names", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:name}}";
+
+		formatFileNameMock.mockResolvedValueOnce("Issue1116");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "03_Aufgabenmanagement/ToDos/W-Tanso",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			null,
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"03_Aufgabenmanagement/ToDos/W-Tanso/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("keeps relative subpaths under the default location when the first segment does not exist at vault root", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce("tasks/Issue1116");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "03_Aufgabenmanagement/ToDos/W-Tanso",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockImplementation(
+			(path: string) => {
+				if (path === "tasks") return null;
+				return null;
+			},
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"03_Aufgabenmanagement/ToDos/W-Tanso/tasks/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("keeps deep relative subpaths under the default location when root segment is missing", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce("sub/tasks/Issue1116");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "03_Aufgabenmanagement/ToDos/W-Tanso",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockReturnValue(
+			null,
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"03_Aufgabenmanagement/ToDos/W-Tanso/sub/tasks/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("does not treat root-level files as folder roots for vault-relative detection", async () => {
+		const { engine, app } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+
+		engine.choice.folder.enabled = false;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+
+		formatFileNameMock.mockResolvedValueOnce("notes/Session");
+		(app.fileManager.getNewFileParent as ReturnType<typeof vi.fn>).mockReturnValue({
+			path: "DailyNotes",
+		});
+		(app.vault.getAbstractFileByPath as ReturnType<typeof vi.fn>).mockImplementation(
+			(path: string) => {
+				if (path === "notes") {
+					const file = new TFile();
+					file.path = "notes";
+					file.name = "notes";
+					file.basename = "notes";
+					file.extension = "";
+					return file;
+				}
+				return null;
+			},
+		);
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"DailyNotes/notes/Session.md",
+			engine.choice.templatePath,
+		);
+	});
+
+	it("never treats filename formats as vault-relative when create in folder is enabled", async () => {
+		const { engine } = createEngine("ignored", {
+			throwDuringFileName: false,
+			stubTemplateContent: true,
+		});
+		const createdFile = new TFile();
+		const createSpy = vi
+			.spyOn(
+				engine as unknown as {
+					createFileWithTemplate: (
+						filePath: string,
+						templatePath: string,
+					) => Promise<TFile | null>;
+				},
+				"createFileWithTemplate",
+			)
+			.mockResolvedValue(createdFile);
+		vi.spyOn(
+			engine as unknown as {
+				getFolderPath: () => Promise<string>;
+			},
+			"getFolderPath",
+		).mockResolvedValue("ConfiguredFolder");
+
+		engine.choice.folder.enabled = true;
+		engine.choice.fileNameFormat.enabled = true;
+		engine.choice.fileNameFormat.format = "{{VALUE:path}}";
+		formatFileNameMock.mockResolvedValueOnce("RootLike/Path/Issue1116");
+
+		await engine.run();
+
+		expect(createSpy).toHaveBeenCalledWith(
+			"ConfiguredFolder/RootLike/Path/Issue1116.md",
+			engine.choice.templatePath,
+		);
+	});
+});

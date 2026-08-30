@@ -1,0 +1,361 @@
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("obsidian-dataview", () => ({ getAPI: vi.fn() }));
+
+import { App } from "obsidian";
+import { fireEvent, render } from "@testing-library/svelte";
+import { flushSync, tick } from "svelte";
+import type QuickAdd from "../../main";
+import type ICaptureChoice from "../../types/choices/ICaptureChoice";
+import CaptureChoiceForm from "./CaptureChoiceForm.svelte";
+import { createCaptureChoiceFormProps } from "./captureChoiceFormProps.svelte";
+import { CaptureChoice } from "../../types/choices/CaptureChoice";
+
+function captureChoice(): ICaptureChoice {
+	return {
+		id: "c1",
+		name: "My Capture",
+		type: "Capture",
+		command: false,
+		captureTo: "Inbox.md",
+		captureToActiveFile: false,
+		captureToCanvasNodeId: "",
+		activeFileWritePosition: "cursor",
+		createFileIfItDoesntExist: {
+			enabled: false,
+			createWithTemplate: false,
+			template: "",
+		},
+		format: { enabled: false, format: "" },
+		prepend: false,
+		appendLink: false,
+		task: false,
+		insertAfter: {
+			enabled: false,
+			after: "",
+			insertAtEnd: false,
+			considerSubsections: false,
+			createIfNotFound: false,
+			createIfNotFoundLocation: "top",
+		},
+		insertBefore: {
+			enabled: false,
+			before: "",
+			createIfNotFound: false,
+			createIfNotFoundLocation: "top",
+		},
+		newLineCapture: { enabled: false, direction: "below" },
+		openFile: false,
+		fileOpening: {
+			location: "tab",
+			direction: "vertical",
+			mode: "default",
+			focus: true,
+		},
+	};
+}
+
+const plugin = {
+	getTemplateFiles: () => [],
+	settings: { choices: [] },
+} as unknown as QuickAdd;
+
+function settingNames(container: HTMLElement): string[] {
+	return Array.from(container.querySelectorAll(".setting-item-name")).map(
+		(el) => el.textContent ?? "",
+	);
+}
+
+function selectUnderSetting(
+	container: HTMLElement,
+	name: string,
+): HTMLSelectElement {
+	const item = Array.from(container.querySelectorAll(".setting-item")).find(
+		(el) => el.querySelector(".setting-item-name")?.textContent === name,
+	);
+	return item?.querySelector("select") as HTMLSelectElement;
+}
+
+function settingItem(container: HTMLElement, name: string): HTMLElement {
+	const item = Array.from(container.querySelectorAll(".setting-item")).find(
+		(el) =>
+			el.querySelector(".setting-item-name")?.textContent?.trim() === name,
+	);
+	if (!item) throw new Error(`Setting item not found: ${name}`);
+	return item as HTMLElement;
+}
+
+function choiceIconInput(container: HTMLElement): HTMLInputElement {
+	const el = container.querySelector<HTMLInputElement>(
+		'input[aria-label="Choice icon"]',
+	);
+	if (!el) throw new Error("Choice icon input not found");
+	return el;
+}
+
+function mountForm() {
+	const props = createCaptureChoiceFormProps({
+		choice: captureChoice(),
+		app: new App(),
+		plugin,
+	});
+	const result = render(CaptureChoiceForm, {
+		props: { choice: props.choice, app: props.app, plugin: props.plugin },
+	});
+	return { ...result, props };
+}
+
+async function settleValidation() {
+	await tick();
+	await tick();
+	// The preview row resolves through an async formatter, so a macrotask flush is
+	// required on top of the microtask ticks before asserting on preview rows.
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await tick();
+}
+
+function describedHint(
+	container: HTMLElement,
+	input: HTMLInputElement,
+): HTMLElement {
+	const hintId = input.getAttribute("aria-describedby");
+	return container.querySelector(`#${hintId}`) as HTMLElement;
+}
+
+function previewRows(container: HTMLElement): HTMLElement[] {
+	return Array.from(container.querySelectorAll(".qa-preview-row"));
+}
+
+describe("CaptureChoiceForm", () => {
+	it("reveals insert-after / insert-before fields by write position, mutually exclusive, without remounting", async () => {
+		const { container } = mountForm();
+		const headerBefore = container.querySelector(".choiceNameHeaderButton");
+		expect(settingNames(container)).not.toContain("Insert after");
+
+		const select = selectUnderSetting(container, "Write position");
+		await fireEvent.change(select, { target: { value: "after" } });
+		flushSync();
+		expect(settingNames(container)).toContain("Insert after");
+		expect(settingNames(container)).not.toContain("Insert before");
+
+		await fireEvent.change(select, { target: { value: "before" } });
+		flushSync();
+		expect(settingNames(container)).toContain("Insert before");
+		expect(settingNames(container)).not.toContain("Insert after");
+
+		// No full remount across all those conditional changes (#1130).
+		expect(container.querySelector(".choiceNameHeaderButton")).toBe(
+			headerBefore,
+		);
+	});
+
+	it("hides the create/open/file-opening sections when capturing to the active file", () => {
+		const { container, props } = mountForm();
+		expect(settingNames(container)).toContain("Create file if it doesn't exist");
+
+		props.choice.captureToActiveFile = true;
+		flushSync();
+		const names = settingNames(container);
+		expect(names).not.toContain("Create file if it doesn't exist");
+		expect(names).not.toContain("Open");
+	});
+
+	it("stays reactive for a freshly created class-instance choice (add-new flow)", () => {
+		// createChoice() returns `new CaptureChoice()` — a class instance. Svelte's
+		// proxy() leaves class instances un-proxied, so the form props factory must
+		// plain-clone the choice or conditional rows won't react. This test fails if
+		// the structuredClone in createCaptureChoiceFormProps is removed.
+		const props = createCaptureChoiceFormProps({
+			choice: new CaptureChoice("New Capture"),
+			app: new App(),
+			plugin,
+		});
+		const { container } = render(CaptureChoiceForm, {
+			props: { choice: props.choice, app: props.app, plugin: props.plugin },
+		});
+		expect(settingNames(container)).toContain("Create file if it doesn't exist");
+
+		props.choice.captureToActiveFile = true;
+		flushSync();
+		expect(settingNames(container)).not.toContain(
+			"Create file if it doesn't exist",
+		);
+	});
+
+	it("persists write-position edits onto the form proxy (snapshot reflects them)", async () => {
+		const { container, props } = mountForm();
+		const select = selectUnderSetting(container, "Write position");
+		await fireEvent.change(select, { target: { value: "before" } });
+		flushSync();
+		// Mutual-exclusivity zeroing held: only insertBefore is enabled.
+		expect(props.choice.insertBefore?.enabled).toBe(true);
+		expect(props.choice.insertAfter.enabled).toBe(false);
+		expect(props.choice.prepend).toBe(false);
+	});
+
+	it("edits the choice icon override and previews the default", async () => {
+		const { container, props } = mountForm();
+		const input = choiceIconInput(container);
+
+		expect(input.placeholder).toBe("pencil");
+		expect(
+			container.querySelector(".qa-choice-icon-setting-preview svg"),
+		).toHaveAttribute("data-icon", "pencil");
+
+		await fireEvent.input(input, { target: { value: "inbox" } });
+		flushSync();
+
+		expect(props.choice.icon).toBe("inbox");
+		expect(
+			container.querySelector(".qa-choice-icon-setting-preview svg"),
+		).toHaveAttribute("data-icon", "inbox");
+	});
+
+	it("keeps the optional icon override at the bottom of the form", () => {
+		const { container } = mountForm();
+
+		expect(settingNames(container).at(-1)).toBe("Icon");
+	});
+
+	it("persists the copy-link-to-clipboard toggle", async () => {
+		const { container, props } = mountForm();
+		expect(props.choice.copyLinkToClipboard).toBeUndefined();
+
+		const toggle = settingItem(container, "Copy link to clipboard").querySelector(
+			".checkbox-container",
+		) as HTMLElement;
+		await fireEvent.click(toggle);
+		flushSync();
+
+		expect(props.choice.copyLinkToClipboard).toBe(true);
+		expect(toggle.classList.contains("is-enabled")).toBe(true);
+	});
+
+	// #1544: the capture target used to be described by three rows — a control-less
+	// "Capture to", the "Capture to active file" toggle, a control-less "File path /
+	// format" — and the input that actually holds it advertised itself as a *file
+	// name* format. One decision, one label, one description, one input.
+	it("describes the capture target with a single labelled field", () => {
+		const { container, getByLabelText } = mountForm();
+		const names = settingNames(container);
+
+		expect(names).not.toContain("File path / format");
+		expect(names.filter((name) => name === "Capture to")).toHaveLength(1);
+
+		const input = getByLabelText("Capture to") as HTMLInputElement;
+		expect(input.placeholder).toBe("Daily/{{DATE}}.md");
+
+		// The label is a real <label for>, and the field lives in the same group.
+		const label = container.querySelector(
+			"label.setting-item-name",
+		) as HTMLLabelElement;
+		expect(label.htmlFor).toBe(input.id);
+		expect(input.closest(".qa-field")).toBe(label.closest(".qa-field"));
+	});
+
+	it("hides the capture format field entirely while the format toggle is off", async () => {
+		const { container, props } = mountForm();
+		const field = () =>
+			settingItem(container, "Capture format").closest(".qa-field") as HTMLElement;
+
+		expect(field().querySelector("textarea")).toBeNull();
+		// With no field to point at there is no dangling <label for>.
+		expect(field().querySelector("label.setting-item-name")).toBeNull();
+
+		const toggle = settingItem(container, "Capture format").querySelector(
+			".checkbox-container",
+		) as HTMLElement;
+		await fireEvent.click(toggle);
+		flushSync();
+
+		expect(props.choice.format.enabled).toBe(true);
+		const textarea = field().querySelector("textarea") as HTMLTextAreaElement;
+		expect(textarea).not.toBeNull();
+		expect(textarea.disabled).toBe(false);
+		expect(
+			(field().querySelector("label.setting-item-name") as HTMLLabelElement)
+				.htmlFor,
+		).toBe(textarea.id);
+	});
+
+	// #1543: the preview used to render above the field it previews, and rendered
+	// as a bare "Preview:" with nothing after it whenever the field was empty.
+	it("renders the preview after the field it previews, and only once the field has a value", async () => {
+		const { container, getByLabelText } = mountForm();
+		const input = getByLabelText("Capture to") as HTMLInputElement;
+
+		await settleValidation();
+		const preview = previewRows(container)[0];
+		expect(preview).toBeDefined();
+		expect(
+			input.compareDocumentPosition(preview) &
+				Node.DOCUMENT_POSITION_FOLLOWING,
+		).toBeTruthy();
+
+		input.value = "";
+		await fireEvent.input(input);
+		await settleValidation();
+		expect(previewRows(container)).toHaveLength(0);
+
+		input.value = "Inbox.md";
+		await fireEvent.input(input);
+		await settleValidation();
+		expect(previewRows(container)).toHaveLength(1);
+		expect(previewRows(container)[0].textContent).toContain("Inbox.md");
+	});
+
+	it("shows recognized feedback and hides the path preview for picker filter targets", async () => {
+		const { container, getByLabelText } = mountForm();
+		const input = getByLabelText("Capture to") as HTMLInputElement;
+		// Only the capture-target preview renders: the capture format is empty, and
+		// an empty field shows no preview row at all (#1543).
+		expect(previewRows(container)).toHaveLength(1);
+
+		input.value = "folder:Goals|folder:Projects|tag:active";
+		await fireEvent.input(input);
+		await settleValidation();
+
+		const hint = describedHint(container, input);
+		expect(previewRows(container)).toHaveLength(0);
+		expect(hint.textContent).toContain("Recognized filtered picker");
+		expect(hint.textContent).toContain("folders Goals or Projects");
+		expect(hint.textContent).toContain("tag active");
+		expect(hint.classList.contains("qa-field-hint--success")).toBe(true);
+		expect(input.classList.contains("is-valid")).toBe(true);
+		expect(input.getAttribute("aria-invalid")).toBe("false");
+	});
+
+	it("rejects multi-select capture target filters before runtime", async () => {
+		const { container, getByLabelText } = mountForm();
+		const input = getByLabelText("Capture to") as HTMLInputElement;
+		expect(previewRows(container)).toHaveLength(1);
+
+		input.value = "tag:work|multi";
+		await fireEvent.input(input);
+		await settleValidation();
+
+		const hint = describedHint(container, input);
+		expect(previewRows(container)).toHaveLength(0);
+		expect(hint.textContent).toBe(
+			"Capture target filters select one destination file. Use {{FILE:...|multi}} in the capture format for multi-value metadata.",
+		);
+		expect(input.classList.contains("is-invalid")).toBe(true);
+		expect(input.getAttribute("aria-invalid")).toBe("true");
+	});
+
+	it("does not show the canvas node picker for filter syntax that ends in .canvas", async () => {
+		const { container, getByLabelText, props } = mountForm();
+		const input = getByLabelText("Capture to") as HTMLInputElement;
+		props.choice.captureToCanvasNodeId = "stale-node-id";
+
+		input.value = "folder:Boards.canvas";
+		await fireEvent.input(input);
+		await settleValidation();
+
+		expect(settingNames(container)).not.toContain("Target canvas node");
+		expect(props.choice.captureToCanvasNodeId).toBe("");
+		expect(describedHint(container, input).textContent).toContain(
+			"Recognized filtered picker",
+		);
+	});
+});

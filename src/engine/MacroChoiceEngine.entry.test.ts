@@ -1,0 +1,887 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MacroChoiceEngine } from "./MacroChoiceEngine";
+import type QuickAdd from "../main";
+import type { IChoiceExecutor } from "../IChoiceExecutor";
+import type IMacroChoice from "../types/choices/IMacroChoice";
+import type { IMacro } from "../types/macros/IMacro";
+import type { IUserScript } from "../types/macros/IUserScript";
+import { CommandType } from "../types/macros/CommandType";
+import type { App } from "obsidian";
+import type { IChoiceCommand } from "../types/macros/IChoiceCommand";
+import type { INestedChoiceCommand } from "../types/macros/QuickCommands/INestedChoiceCommand";
+import type IChoice from "../types/choices/IChoice";
+import { MacroAbortError } from "../errors/MacroAbortError";
+import { QuickAddApi } from "../quickAddApi";
+
+const { mockGetUserScript, mockInitializeUserScriptSettings, mockSuggest, mockGetApi, mockInputPrompt } =
+	vi.hoisted(() => ({
+		mockGetUserScript: vi.fn(),
+		mockInitializeUserScriptSettings: vi.fn(),
+		mockSuggest: vi.fn(),
+		mockGetApi: vi.fn(() => ({})),
+		mockInputPrompt: vi.fn(),
+	}));
+
+vi.mock("../utilityObsidian", async () => {
+	const actual = await vi.importActual<Record<string, unknown>>(
+		"../utilityObsidian",
+	);
+
+	return {
+		...actual,
+		getUserScript: mockGetUserScript,
+	};
+});
+
+vi.mock("../utils/userScriptSettings", () => ({
+	initializeUserScriptSettings: mockInitializeUserScriptSettings,
+}));
+
+vi.mock("../gui/choiceList/ChoiceView.svelte", () => ({}));
+vi.mock("../gui/GlobalVariables/GlobalVariablesView.svelte", () => ({}));
+vi.mock("../gui/GenericInputPrompt/GenericInputPrompt", () => ({
+	__esModule: true,
+	default: {
+		Prompt: mockInputPrompt,
+	},
+}));
+vi.mock("../gui/VDateInputPrompt/VDateInputPrompt", () => ({
+	__esModule: true,
+	default: {
+		Prompt: vi.fn(),
+	},
+}));
+vi.mock("../gui/GenericCheckboxPrompt/genericCheckboxPrompt", () => ({
+	__esModule: true,
+	default: { Open: vi.fn() },
+}));
+vi.mock("../gui/GenericInfoDialog/GenericInfoDialog", () => ({
+	__esModule: true,
+	default: { Show: vi.fn() },
+}));
+vi.mock("../gui/GenericWideInputPrompt/GenericWideInputPrompt", () => ({
+	__esModule: true,
+	default: { Prompt: vi.fn() },
+}));
+vi.mock("../gui/GenericYesNoPrompt/GenericYesNoPrompt", () => ({
+	__esModule: true,
+	default: { Prompt: vi.fn() },
+}));
+vi.mock("../gui/InputSuggester/inputSuggester", () => ({
+	__esModule: true,
+	default: { Suggest: vi.fn() },
+}));
+vi.mock("../preflight/OnePageInputModal", () => ({
+	OnePageInputModal: class {
+		waitForClose: Promise<never>;
+		constructor() {
+			this.waitForClose = Promise.reject("cancelled");
+		}
+	}
+}));
+
+vi.mock("../gui/GenericSuggester/genericSuggester", () => ({
+	__esModule: true,
+	default: class {
+		static Suggest = mockSuggest;
+
+		constructor() {
+			// no-op
+		}
+	},
+}));
+
+vi.mock("../main", () => ({
+	__esModule: true,
+	default: class QuickAddMock {},
+}));
+
+vi.mock("../quickAddSettingsTab", () => ({
+	DEFAULT_SETTINGS: {},
+	QuickAddSettingsTab: class {},
+}));
+
+vi.mock("../settingsStore", () => ({
+	settingsStore: {
+		getState: () => ({ ai: {}, disableOnlineFeatures: false }),
+	},
+}));
+
+vi.mock("../formatters/completeFormatter", () => ({
+	CompleteFormatter: class CompleteFormatterMock {},
+}));
+
+vi.mock("../ai/AIAssistant", () => ({
+	runAIAssistant: vi.fn(),
+}));
+
+vi.mock("../ai/aiHelpers", () => ({
+	getModelByName: vi.fn(),
+	getModelNames: vi.fn().mockReturnValue([]),
+	getModelProvider: vi.fn().mockReturnValue({ apiKey: "" }),
+}));
+
+describe("MacroChoiceEngine user script entry handling", () => {
+	const app = {} as App;
+	const plugin = {} as unknown as QuickAdd;
+
+	let choiceExecutor: IChoiceExecutor;
+	let variables: Map<string, unknown>;
+	let macroChoice: IMacroChoice;
+	let userScriptCommand: IUserScript;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockGetUserScript.mockReset();
+		mockInitializeUserScriptSettings.mockReset();
+		mockSuggest.mockReset();
+		mockGetApi.mockReset();
+		mockGetApi.mockImplementation(() => ({}));
+
+		variables = new Map<string, unknown>();
+
+		choiceExecutor = {
+			execute: vi.fn(),
+			variables,
+		};
+
+		userScriptCommand = {
+			id: "user-script",
+			name: "Script",
+			type: CommandType.UserScript,
+			path: "script.js",
+			settings: {},
+		};
+
+		macroChoice = {
+			id: "macro-1",
+			name: "My Macro",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-1",
+				name: "My Macro",
+				commands: [userScriptCommand],
+			} as IMacro,
+		};
+	});
+
+	it("runs the entry export without prompting when no settings are defined", async () => {
+		const entryFn = vi.fn().mockResolvedValue("entry-result");
+
+		mockGetUserScript.mockResolvedValue({
+			entry: entryFn,
+		});
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(mockInitializeUserScriptSettings).not.toHaveBeenCalled();
+		expect(mockSuggest).not.toHaveBeenCalled();
+		expect(entryFn).toHaveBeenCalledTimes(1);
+		const [paramsArg, settingsArg] = entryFn.mock.calls[0];
+		expect(settingsArg).toEqual({});
+		expect(paramsArg).toHaveProperty("variables");
+		expect(engine["output"]).toBe("entry-result");
+	});
+
+	// Requirement collection (one-page preflight / non-interactive CLI) already
+	// loaded - and thereby executed - the script's module body; the engine must
+	// consume that module instead of loading it again, and must consume it only
+	// ONCE so a later run of the same command loads fresh.
+	it("consumes a preloaded user-script module instead of re-loading it", async () => {
+		const entryFn = vi.fn().mockResolvedValue("entry-result");
+		const preloaded = new Map<string, unknown>([
+			["script.js", { entry: entryFn }],
+		]);
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+			preloaded,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(mockGetUserScript).not.toHaveBeenCalled();
+		expect(entryFn).toHaveBeenCalledTimes(1);
+		// Delete-on-use: the preloaded execution is spent.
+		expect(preloaded.has("script.js")).toBe(false);
+
+		// A second execution of the same command loads (and thus runs) fresh.
+		mockGetUserScript.mockResolvedValue({ entry: entryFn });
+		await engine["executeUserScript"](userScriptCommand);
+		expect(mockGetUserScript).toHaveBeenCalledTimes(1);
+	});
+
+	// Preloaded values are member-DRILLED exports, so a command drilling a
+	// different `::` member of the same file must NOT consume another
+	// member's entry (path-only keying executed the wrong function).
+	it("does not consume a preloaded entry cached for a different :: member", async () => {
+		const fooEntry = vi.fn().mockResolvedValue("foo-result");
+		const barEntry = vi.fn().mockResolvedValue("bar-result");
+		const preloaded = new Map<string, unknown>([
+			["script.js::foo", { entry: fooEntry }],
+		]);
+		mockGetUserScript.mockResolvedValue({ entry: barEntry });
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+			preloaded,
+		);
+
+		const barCommand = { ...userScriptCommand, name: "Script::bar" };
+		await engine["executeUserScript"](barCommand);
+
+		// bar must load fresh (and run barEntry), leaving foo's entry intact.
+		expect(mockGetUserScript).toHaveBeenCalledTimes(1);
+		expect(barEntry).toHaveBeenCalledTimes(1);
+		expect(fooEntry).not.toHaveBeenCalled();
+		expect(preloaded.has("script.js::foo")).toBe(true);
+
+		const fooCommand = { ...userScriptCommand, name: "Script::foo" };
+		await engine["executeUserScript"](fooCommand);
+		expect(fooEntry).toHaveBeenCalledTimes(1);
+		expect(mockGetUserScript).toHaveBeenCalledTimes(1);
+		expect(preloaded.has("script.js::foo")).toBe(false);
+	});
+
+	it("initializes user script settings only from object-shaped settings exports", async () => {
+		const entryFn = vi.fn().mockResolvedValue("entry-result");
+		const settings = {
+			apiKey: {
+				type: "text",
+				defaultValue: "abc123",
+			},
+		};
+
+		mockGetUserScript.mockResolvedValue({
+			entry: entryFn,
+			settings,
+		});
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(mockInitializeUserScriptSettings).toHaveBeenCalledWith(
+			userScriptCommand.settings,
+			settings,
+		);
+		expect(entryFn).toHaveBeenCalledWith(
+			expect.objectContaining({ variables: expect.any(Object) }),
+			userScriptCommand.settings,
+		);
+	});
+
+	it("migrates legacy plaintext secret settings before invoking the entry export", async () => {
+		const entryFn = vi.fn().mockResolvedValue("entry-result");
+		const secretStore = new Map<string, string>();
+		const secretApp = {
+			secretStorage: {
+				getSecret: vi.fn((name: string) => secretStore.get(name) ?? null),
+				setSecret: vi.fn((name: string, value: string) => {
+					secretStore.set(name, value);
+				}),
+			},
+		} as unknown as App;
+		const saveSettings = vi.fn().mockResolvedValue(undefined);
+		const pluginWithSave = { saveSettings } as unknown as QuickAdd;
+		userScriptCommand.settings = {
+			"API Key": "legacy-secret",
+		};
+
+		mockGetUserScript.mockResolvedValue({
+			entry: entryFn,
+			settings: {
+				options: {
+					"API Key": {
+						type: "secret",
+					},
+				},
+			},
+		});
+
+		const engine = new MacroChoiceEngine(
+			secretApp,
+			pluginWithSave,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(secretStore.get("quickadd-user-script-user-script-api-key")).toBe(
+			"legacy-secret",
+		);
+		expect(JSON.stringify(userScriptCommand.settings)).not.toContain(
+			"legacy-secret",
+		);
+		expect(entryFn).toHaveBeenCalledWith(
+			expect.objectContaining({ variables: expect.any(Object) }),
+			{ "API Key": "legacy-secret" },
+		);
+		expect(saveSettings).toHaveBeenCalledTimes(1);
+	});
+
+	it("ignores malformed primitive settings exports at the user-script boundary", async () => {
+		const entryFn = vi.fn().mockResolvedValue("entry-result");
+
+		mockGetUserScript.mockResolvedValue({
+			entry: entryFn,
+			settings: "not-settings",
+		});
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(mockInitializeUserScriptSettings).not.toHaveBeenCalled();
+		expect(entryFn).toHaveBeenCalledWith(
+			expect.objectContaining({ variables: expect.any(Object) }),
+			userScriptCommand.settings,
+		);
+	});
+
+	it("prompts the user when no entry export is defined", async () => {
+		const optionFn = vi.fn().mockResolvedValue("option-result");
+
+		mockGetUserScript.mockResolvedValue({
+			option1: optionFn,
+		});
+		mockSuggest.mockResolvedValueOnce("option1");
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine["executeUserScript"](userScriptCommand);
+
+		expect(mockSuggest).toHaveBeenCalledTimes(1);
+		expect(optionFn).toHaveBeenCalledTimes(1);
+		expect(engine["output"]).toBe("option-result");
+	});
+});
+
+describe("MacroChoiceEngine user script variable propagation", () => {
+	const app = {} as App;
+	const plugin = {} as unknown as QuickAdd;
+
+	let choiceExecutor: IChoiceExecutor;
+	let variables: Map<string, unknown>;
+	let macroChoice: IMacroChoice;
+	let logs: Array<number | undefined>;
+	let getApiSpy: ReturnType<typeof vi.spyOn>;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockGetUserScript.mockReset();
+		mockInitializeUserScriptSettings.mockReset();
+		mockSuggest.mockReset();
+
+		getApiSpy = vi
+			.spyOn(QuickAddApi, "GetApi")
+			.mockReturnValue({} as unknown as ReturnType<typeof QuickAddApi.GetApi>);
+
+		logs = [];
+		variables = new Map<string, unknown>();
+		choiceExecutor = {
+			execute: vi.fn(),
+			variables,
+		};
+
+		const makeScript = (index: number): IUserScript => ({
+			id: `script-${index}`,
+			name: `Script ${index}`,
+			type: CommandType.UserScript,
+			path: `script-${index}.js`,
+			settings: {},
+		});
+
+		macroChoice = {
+			id: "macro-sequence",
+			name: "Macro sequence",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-sequence",
+				name: "Macro sequence",
+				commands: [
+					makeScript(1),
+					makeScript(2),
+					makeScript(3),
+					makeScript(4),
+				],
+			} as IMacro,
+		};
+
+		mockGetUserScript.mockImplementation((command: IUserScript) => {
+			const nextValueByPath: Record<string, number> = {
+				"script-1.js": 1,
+				"script-2.js": 2,
+				"script-3.js": 3,
+				"script-4.js": 3,
+			};
+
+			const nextValue = nextValueByPath[command.path ?? ""] ?? 0;
+
+			return Promise.resolve(async (params: { variables: Record<string, unknown> }) => {
+				logs.push(params.variables.target as number | undefined);
+				if (nextValue !== 0) {
+					params.variables.target = nextValue;
+				}
+			});
+		});
+	});
+
+	afterEach(() => {
+		getApiSpy.mockRestore();
+	});
+
+	it("propagates variable mutations across sequential user scripts", async () => {
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine.run();
+
+		expect(logs).toEqual([undefined, 1, 2, 3]);
+		expect(choiceExecutor.variables.get("target")).toBe(3);
+	});
+
+	it("merges existing executor variables into provided map without losing state", async () => {
+		const executorVariables = new Map<string, unknown>([
+			["keep", "executor"],
+		]);
+		const providedVariables = new Map<string, unknown>([
+			["override", 1],
+		]);
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			{
+				...choiceExecutor,
+				variables: executorVariables,
+			},
+			providedVariables,
+		);
+
+		expect(engine["params"].variables.keep).toBe("executor");
+		expect(engine["params"].variables.override).toBe(1);
+		expect(engine["choiceExecutor"].variables).toBe(providedVariables);
+	});
+
+	it("treats `params.variables = {...}` as replacing the backing map", async () => {
+		const assignScript: IUserScript = {
+			id: "assign-script",
+			name: "Assign Script",
+			type: CommandType.UserScript,
+			path: "assign-script.js",
+			settings: {},
+		};
+
+		const assignChoice: IMacroChoice = {
+			id: "macro-assign",
+			name: "Macro assign",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-assign",
+				name: "Macro assign",
+				commands: [assignScript],
+			} as IMacro,
+		};
+
+		mockGetUserScript.mockImplementationOnce(() => {
+			return Promise.resolve(async (params: { variables: Record<string, unknown> }) => {
+				params.variables = { foo: "bar" };
+			});
+		});
+
+		variables.set("old", "value");
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			assignChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.variables.get("foo")).toBe("bar");
+		expect(choiceExecutor.variables.has("old")).toBe(false);
+	});
+
+	it("does not clear variables when assigned the same backing map", async () => {
+		const assignSameScript: IUserScript = {
+			id: "assign-same-script",
+			name: "Assign Same Script",
+			type: CommandType.UserScript,
+			path: "assign-same-script.js",
+			settings: {},
+		};
+
+		const assignSameChoice: IMacroChoice = {
+			id: "macro-assign-same",
+			name: "Macro assign same",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-assign-same",
+				name: "Macro assign same",
+				commands: [assignSameScript],
+			} as IMacro,
+		};
+
+		mockGetUserScript.mockImplementationOnce(() => {
+			return Promise.resolve(async (params: { variables: Record<string, unknown> }) => {
+				params.variables = params.variables;
+				params.variables.added = 2;
+			});
+		});
+
+		variables.set("old", "value");
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			assignSameChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.variables.get("old")).toBe("value");
+		expect(choiceExecutor.variables.get("added")).toBe(2);
+	});
+
+	it("ignores invalid reassignment of params.variables without clearing", async () => {
+		const invalidAssignScript: IUserScript = {
+			id: "invalid-assign-script",
+			name: "Invalid assign Script",
+			type: CommandType.UserScript,
+			path: "invalid-assign-script.js",
+			settings: {},
+		};
+
+		const invalidAssignChoice: IMacroChoice = {
+			id: "macro-invalid-assign",
+			name: "Macro invalid assign",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-invalid-assign",
+				name: "Macro invalid assign",
+				commands: [invalidAssignScript],
+			} as IMacro,
+		};
+
+		mockGetUserScript.mockImplementationOnce(() => {
+			return Promise.resolve(async (params: { variables: any }) => {
+				params.variables = 123;
+				params.variables.added = "ok";
+			});
+		});
+
+		variables.set("old", "value");
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			invalidAssignChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.variables.get("old")).toBe("value");
+		expect(choiceExecutor.variables.get("added")).toBe("ok");
+	});
+
+	it("skips non-string Map keys when assigning params.variables", async () => {
+		const mapAssignScript: IUserScript = {
+			id: "map-assign-script",
+			name: "Map assign Script",
+			type: CommandType.UserScript,
+			path: "map-assign-script.js",
+			settings: {},
+		};
+
+		const mapAssignChoice: IMacroChoice = {
+			id: "macro-map-assign",
+			name: "Macro map assign",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-map-assign",
+				name: "Macro map assign",
+				commands: [mapAssignScript],
+			} as IMacro,
+		};
+
+		mockGetUserScript.mockImplementationOnce(() => {
+			return Promise.resolve(async (params: { variables: any }) => {
+				params.variables = new Map<any, any>([
+					[1, "nope"],
+					["foo", "bar"],
+				]);
+			});
+		});
+
+		variables.set("old", "value");
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			mapAssignChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await engine.run();
+
+		expect(choiceExecutor.variables.get("foo")).toBe("bar");
+		expect(choiceExecutor.variables.has("old")).toBe(false);
+		expect(choiceExecutor.variables.has(1 as any)).toBe(false);
+	});
+});
+
+describe("MacroChoiceEngine choice command cancellation", () => {
+	const app = {} as App;
+	let plugin: QuickAdd & { getChoiceById: ReturnType<typeof vi.fn> };
+	let choiceExecutor: IChoiceExecutor;
+	let variables: Map<string, unknown>;
+	let macroChoice: IMacroChoice;
+
+	beforeEach(() => {
+		plugin = {
+			getChoiceById: vi.fn(),
+		} as unknown as QuickAdd & { getChoiceById: ReturnType<typeof vi.fn> };
+		variables = new Map<string, unknown>();
+		choiceExecutor = {
+			execute: vi.fn(),
+			variables,
+			signalAbort: vi.fn(),
+			consumeAbortSignal: vi.fn().mockReturnValue(null),
+		};
+		macroChoice = {
+			id: "macro-choice",
+			name: "Macro",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-id",
+				name: "Macro",
+				commands: [],
+			} as IMacro,
+		};
+	});
+
+	it("wraps cancellation errors from executeChoice in MacroAbortError", async () => {
+		const getApiSpy = vi.spyOn(QuickAddApi, "GetApi");
+		getApiSpy.mockReturnValueOnce({} as any);
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+		const choice: IChoice = {
+			id: "target-choice",
+			name: "Target",
+			type: "Macro",
+			command: false,
+		};
+		(plugin.getChoiceById as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+			choice,
+		);
+		const command: IChoiceCommand = {
+			id: "choice-command",
+			name: "Run choice",
+			type: CommandType.Choice,
+			choiceId: "target-choice",
+		};
+		const abortError = new MacroAbortError("Input cancelled by user");
+		choiceExecutor.execute = vi.fn().mockResolvedValue(undefined);
+		(choiceExecutor.consumeAbortSignal as ReturnType<typeof vi.fn>).mockReturnValueOnce(abortError);
+
+		await expect(
+			(engine as unknown as { executeChoice: (cmd: IChoiceCommand) => Promise<void> }).executeChoice(
+				command,
+			),
+		).rejects.toThrow(MacroAbortError);
+		expect(choiceExecutor.execute).toHaveBeenCalledWith(choice);
+		expect(choiceExecutor.consumeAbortSignal).toHaveBeenCalledTimes(1);
+	});
+
+	it("wraps cancellation errors from executeNestedChoice in MacroAbortError", async () => {
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+		const choice: IChoice = {
+			id: "nested-choice",
+			name: "Nested",
+			type: "Macro",
+			command: false,
+		};
+		const command: INestedChoiceCommand = {
+			id: "nested-command",
+			name: "Nested choice",
+			type: CommandType.NestedChoice,
+			choice,
+		};
+		const abortError = new MacroAbortError("Input cancelled by user");
+		choiceExecutor.execute = vi.fn().mockResolvedValue(undefined);
+		(choiceExecutor.consumeAbortSignal as ReturnType<typeof vi.fn>).mockReturnValueOnce(abortError);
+
+		await expect(
+			(engine as unknown as {
+				executeNestedChoice: (
+					cmd: INestedChoiceCommand,
+				) => Promise<void>;
+			}).executeNestedChoice(command),
+		).rejects.toThrow(MacroAbortError);
+		expect(choiceExecutor.execute).toHaveBeenCalledWith(choice);
+		expect(choiceExecutor.consumeAbortSignal).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("MacroChoiceEngine malformed saved command entries", () => {
+	const executeCommandById = vi.fn();
+	const app = {
+		commands: {
+			executeCommandById,
+		},
+	} as unknown as App;
+	const plugin = {} as unknown as QuickAdd;
+
+	let choiceExecutor: IChoiceExecutor;
+	let variables: Map<string, unknown>;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		executeCommandById.mockReset();
+		variables = new Map<string, unknown>();
+		choiceExecutor = {
+			execute: vi.fn(),
+			variables,
+		};
+	});
+
+	it("skips nullish persisted macro command entries without blocking valid commands", async () => {
+		const macroChoice: IMacroChoice = {
+			id: "macro-nullish-commands",
+			name: "Macro with nullish commands",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: {
+				id: "macro-nullish-commands",
+				name: "Macro with nullish commands",
+				commands: [
+					null,
+					undefined,
+					{
+						id: "obsidian-command",
+						name: "Run Obsidian command",
+						type: CommandType.Obsidian,
+						commandId: "app:valid-command",
+					},
+				] as unknown as IMacro["commands"],
+			} as IMacro,
+		};
+
+		const engine = new MacroChoiceEngine(
+			app,
+			plugin,
+			macroChoice,
+			choiceExecutor,
+			variables,
+		);
+
+		await expect(engine.run()).resolves.toBeUndefined();
+		expect(executeCommandById).toHaveBeenCalledTimes(1);
+		expect(executeCommandById).toHaveBeenCalledWith("app:valid-command");
+	});
+});
+
+describe("QuickAddApi prompt cancellation", () => {
+	const app = {} as App;
+
+	beforeEach(() => {
+		mockInputPrompt.mockReset();
+	});
+
+	it("throws MacroAbortError when input prompt is cancelled", async () => {
+		mockInputPrompt.mockRejectedValueOnce("No input given.");
+
+		await expect(
+			QuickAddApi.inputPrompt(app, "Enter value"),
+		).rejects.toThrow(MacroAbortError);
+	});
+
+	// A genuine failure must NOT come back as "the user gave no input" (#1575):
+	// the script would carry on and act on a value that was never entered.
+	it("propagates other prompt errors instead of resolving undefined", async () => {
+		const failure = new Error("boom");
+		mockInputPrompt.mockRejectedValueOnce(failure);
+
+		await expect(QuickAddApi.inputPrompt(app, "Enter value")).rejects.toBe(
+			failure,
+		);
+	});
+});

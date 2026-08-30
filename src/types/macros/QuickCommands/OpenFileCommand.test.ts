@@ -1,0 +1,55 @@
+import { describe, it, expect } from "vitest";
+import { OpenFileCommand } from "./OpenFileCommand";
+import { CommandType } from "../CommandType";
+import { NewTabDirection } from "../../newTabDirection";
+
+describe("OpenFileCommand", () => {
+	it("should create a command with default values", () => {
+		const command = new OpenFileCommand();
+		
+		expect(command.type).toBe(CommandType.OpenFile);
+		expect(command.filePath).toBe("{{DATE}}.md");
+		expect(command.openInNewTab).toBe(false);
+		expect(command.location).toBeUndefined();
+		expect(command.name).toBe("Open file: {{DATE}}.md");
+		expect(command.id).toBeDefined();
+	});
+
+	it("should create a command with custom values", () => {
+		const command = new OpenFileCommand(
+			"notes/{{VALUE}}.md",
+			true,
+			NewTabDirection.vertical,
+			"split",
+			false
+		);
+		
+		expect(command.filePath).toBe("notes/{{VALUE}}.md");
+		expect(command.openInNewTab).toBe(true);
+		expect(command.direction).toBe(NewTabDirection.vertical);
+		expect(command.location).toBe("split");
+		expect(command.focus).toBe(false);
+		expect(command.name).toBe("Open file: notes/{{VALUE}}.md");
+	});
+
+	it("syncs legacy flags from location when provided", () => {
+		const splitCommand = new OpenFileCommand("file.md", false, undefined, "split");
+		expect(splitCommand.openInNewTab).toBe(true);
+		expect(splitCommand.direction).toBe("vertical");
+
+		const tabCommand = new OpenFileCommand("file.md", true, undefined, "tab");
+		expect(tabCommand.openInNewTab).toBe(false);
+		expect(tabCommand.direction).toBeUndefined();
+
+		const windowCommand = new OpenFileCommand("file.md", false, undefined, "window");
+		expect(windowCommand.openInNewTab).toBe(true);
+		expect(windowCommand.direction).toBeUndefined();
+	});
+
+	it("should generate unique IDs for different instances", () => {
+		const command1 = new OpenFileCommand();
+		const command2 = new OpenFileCommand();
+		
+		expect(command1.id).not.toBe(command2.id);
+	});
+});

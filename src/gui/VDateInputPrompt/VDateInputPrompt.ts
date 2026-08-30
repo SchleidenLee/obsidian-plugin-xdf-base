@@ -1,0 +1,350 @@
+import type { App, Debouncer } from "obsidian";
+import { Notice, TextComponent, debounce } from "obsidian";
+import GenericInputPrompt from "../GenericInputPrompt/GenericInputPrompt";
+import type { InputPromptOptions } from "../../types/inputPrompt";
+import { createDatePicker, type DatePickerController } from "../date-picker/datePicker";
+import { formatISODate, parseNaturalLanguageDate } from "../../utils/dateParser";
+import { settingsStore } from "../../settingsStore";
+import {
+	formatDateAliasInline,
+	getOrderedDateAliases,
+} from "../../utils/dateAliases";
+
+export default class VDateInputPrompt extends GenericInputPrompt {
+	protected supportsPeek(): boolean {
+		return false;
+	}
+	private previewEl: HTMLElement;
+	private dateFormat: string;
+	private updatePreviewDebounced: Debouncer<[], void>;
+	private currentInput: string;
+	private isOpen = true;
+	private defaultValue: string | undefined;
+	private withTime: boolean;
+	private pickerHostEl: HTMLElement;
+	private datePicker?: DatePickerController;
+	private selectedIso?: string;
+	private lastPickerDisplayValue?: string;
+	private static readonly PREVIEW_PLACEHOLDER = "Preview will appear here";
+
+	public static Prompt(
+		app: App,
+		header: string,
+		placeholder?: string,
+		defaultValue?: string,
+		dateFormat?: string,
+		options?: InputPromptOptions,
+		withTime?: boolean
+	): Promise<string> {
+		const newPromptModal = new VDateInputPrompt(
+			app,
+			header,
+			placeholder,
+			defaultValue,
+			dateFormat,
+			options,
+			withTime
+		);
+		return newPromptModal.waitForClose;
+	}
+
+	protected constructor(
+		app: App,
+		header: string,
+		placeholder?: string,
+		defaultValue?: string,
+		dateFormat?: string,
+		options?: InputPromptOptions,
+		withTime?: boolean
+	) {
+		// Pass the defaultValue to the parent so the input box is pre-filled
+		super(app, header, placeholder, defaultValue ?? "", undefined, undefined, options);
+
+		this.containerEl.addClass("qaDatePrompt");
+		this.withTime = withTime === true;
+		// A |time/|datetime token without an explicit format gets a datetime
+		// default so the rendered value carries the time the user picked.
+		this.dateFormat =
+			dateFormat || (this.withTime ? "YYYY-MM-DD HH:mm" : "YYYY-MM-DD");
+		this.defaultValue = defaultValue;
+		// super() (via display() -> createInputField) already hydrated the input
+		// element + this.currentInput to the restored draft (or the defaultValue
+		// when there is no draft). Seed currentInput from the actual input value
+		// so the initial preview reflects a restored draft instead of being
+		// clobbered back to the defaultValue.
+		this.currentInput = this.inputComponent?.inputEl?.value ?? defaultValue ?? "";
+
+		// Mount the picker here (NOT in createInputField, which runs during the
+		// super() display() call before this.withTime is set), so the time
+		// control reflects the |time/|datetime flag.
+		this.mountDatePicker();
+
+		// Create debounced preview update function (250ms delay, reset on each call)
+		this.updatePreviewDebounced = debounce(
+			this.updatePreview.bind(this),
+			250,
+			true // Reset timer on each call (standard debounce behavior)
+		);
+
+		this.updatePreview();
+	}
+
+	protected createInputField(
+		container: HTMLElement,
+		placeholder?: string,
+		value?: string
+	) {
+		container.addClass("qa-date-input");
+
+		// Create TextComponent directly to avoid duplicate onChange listeners
+		const textComponent = new TextComponent(container);
+		
+		textComponent.inputEl.addClass("qa-vdate-input");
+		textComponent
+			.setPlaceholder(placeholder ?? "")
+			.setValue(value ?? "")
+			.onChange((newValue) => {
+				this.lastPickerDisplayValue = undefined;
+				this.onInputChanged(newValue);
+				this.currentInput = newValue;
+				this.updatePreviewDebounced();
+			})
+			.inputEl.addEventListener("keydown", this.submitEnterCallback);
+		
+		// Initialize currentInput with the initial value (which should be defaultValue)
+		this.currentInput = value ?? "";
+
+		// Only reserve the host element here (runs during super(), before
+		// this.withTime is known); the picker itself is mounted from the
+		// constructor body via mountDatePicker().
+		this.pickerHostEl = container.createDiv({
+			cls: "qa-date-picker-container",
+		});
+
+		// Create preview element
+		this.createPreviewElement(container);
+
+		return textComponent;
+	}
+
+	private mountDatePicker() {
+		this.datePicker = createDatePicker({
+			container: this.pickerHostEl,
+			initialIso: this.selectedIso,
+			withTime: this.withTime,
+			onSelect: (iso) => {
+				if (iso) this.applyPickerSelection(iso);
+				else this.clearPickerSelection();
+			},
+		});
+	}
+
+	private createPreviewElement(container: HTMLElement) {
+		const previewContainer = container.createDiv("vdate-preview-container");
+		
+		previewContainer.createEl("div", {
+			text: "Preview:",
+			cls: "vdate-preview-label"
+		});
+		
+		this.previewEl = previewContainer.createEl("div", {
+			cls: "vdate-preview-text"
+		});
+		this.previewEl.textContent = VDateInputPrompt.PREVIEW_PLACEHOLDER;
+
+		const aliasEntries = getOrderedDateAliases(
+			settingsStore.getState().dateAliases,
+		);
+		if (aliasEntries.length > 0) {
+			const aliasDetails = previewContainer.createEl("details", {
+				cls: "vdate-alias-details",
+			});
+
+			const aliasSummary = aliasDetails.createEl("summary", {
+				text: `Aliases (${aliasEntries.length})`,
+			});
+			aliasSummary.addClass("vdate-alias-summary");
+
+			const aliasList = aliasDetails.createEl("div", {
+				cls: "vdate-alias-list",
+			});
+			aliasList.textContent = formatDateAliasInline(
+				settingsStore.getState().dateAliases,
+			);
+		}
+	}
+
+	private updatePreview() {
+		// Don't update if modal is closed
+		if (!this.isOpen) return;
+
+		const input = this.currentInput.trim();
+
+		// If no input and we have a default, show preview for default.
+		// Optional prompts skip this: a cleared box means "leave empty".
+		if (!input && this.defaultValue && !this.isOptionalPrompt) {
+			this.renderPreviewFromInput(this.defaultValue);
+			return;
+		}
+
+		if (!input) {
+			this.selectedIso = undefined;
+			this.lastPickerDisplayValue = undefined;
+			this.syncPickerSelection();
+			// An optional blank is an intentional answer, so reassure the user it
+			// will be left empty (matching the one-page date field) rather than
+			// showing the neutral "Preview will appear here" placeholder.
+			this.setPreviewText(
+				this.isOptionalPrompt
+					? "Will be left empty"
+					: VDateInputPrompt.PREVIEW_PLACEHOLDER,
+				false,
+			);
+			return;
+		}
+
+		if (input.startsWith("@date:")) {
+			const iso = input.slice(6).trim();
+			if (iso) {
+				this.selectedIso = iso;
+				this.lastPickerDisplayValue = undefined;
+				this.syncPickerSelection(iso);
+				this.renderPreviewFromIso(iso);
+				return;
+			}
+		}
+
+		if (
+			this.selectedIso &&
+			this.lastPickerDisplayValue &&
+			input === this.lastPickerDisplayValue
+		) {
+			this.syncPickerSelection(this.selectedIso, false);
+			this.renderPreviewFromIso(this.selectedIso);
+			return;
+		}
+
+		// If input matches default value or regular input, render the preview
+		this.renderPreviewFromInput(input);
+	}
+
+	private formatIsoForInput(iso: string): string {
+		const formatted = formatISODate(iso, this.dateFormat);
+		if (formatted) return formatted;
+		return iso.length >= 10 ? iso.slice(0, 10) : iso;
+	}
+
+	private syncPickerSelection(iso?: string, updateView = true) {
+		this.datePicker?.setSelectedIso(iso, { updateView });
+	}
+
+	private applyPickerSelection(iso: string) {
+		const displayValue = this.formatIsoForInput(iso);
+		this.selectedIso = iso;
+		this.lastPickerDisplayValue = displayValue;
+		if (this.inputComponent?.inputEl) {
+			this.inputComponent.inputEl.value = displayValue;
+		}
+		this.onInputChanged(displayValue);
+		this.currentInput = displayValue;
+		this.syncPickerSelection(iso);
+		this.renderPreviewFromIso(iso);
+	}
+
+	private clearPickerSelection() {
+		if (this.inputComponent?.inputEl) {
+			this.inputComponent.inputEl.value = "";
+		}
+		this.onInputChanged("");
+		this.currentInput = "";
+		this.selectedIso = undefined;
+		this.lastPickerDisplayValue = undefined;
+		this.syncPickerSelection();
+		this.updatePreview();
+	}
+
+	private renderPreviewFromIso(iso: string) {
+		this.setPreviewText(this.formatIsoForInput(iso), false);
+	}
+
+	private renderPreviewFromInput(value: string) {
+		const parseResult = parseNaturalLanguageDate(value, this.dateFormat);
+
+		if (parseResult.isValid && parseResult.isoString) {
+			this.selectedIso = parseResult.isoString;
+			this.lastPickerDisplayValue = undefined;
+			this.syncPickerSelection(parseResult.isoString);
+			const formatted =
+				parseResult.formatted ?? this.formatIsoForInput(parseResult.isoString);
+			this.setPreviewText(formatted, false);
+		} else {
+			this.selectedIso = undefined;
+			this.lastPickerDisplayValue = undefined;
+			this.syncPickerSelection();
+			const errorMessage = parseResult.error || "Unable to parse date";
+			this.setPreviewText(errorMessage, true);
+		}
+	}
+
+	private setPreviewText(text: string, isError: boolean) {
+		this.previewEl.textContent = text;
+		this.previewEl.toggleClass("is-error", isError);
+	}
+
+	onOpen() {
+		super.onOpen();
+	}
+
+	protected transformInputOnSubmit(input: string): string {
+		const trimmed = input.trim();
+		if (trimmed.startsWith("@date:")) return trimmed;
+		if (
+			this.selectedIso &&
+			this.lastPickerDisplayValue &&
+			trimmed === this.lastPickerDisplayValue
+		) {
+			return `@date:${this.selectedIso}`;
+		}
+		// Optional prompts take an empty box at face value instead of
+		// resurrecting the default the user just cleared.
+		if (!trimmed && this.defaultValue && !this.isOptionalPrompt) {
+			const parsed = parseNaturalLanguageDate(
+				this.defaultValue,
+				this.dateFormat,
+			);
+			if (parsed.isValid && parsed.isoString) {
+				return `@date:${parsed.isoString}`;
+			}
+		}
+		if (trimmed) {
+			const parsed = parseNaturalLanguageDate(trimmed, this.dateFormat);
+			if (parsed.isValid && parsed.isoString) {
+				return `@date:${parsed.isoString}`;
+			}
+			// The preview already shows this typed text is not a valid date; the
+			// raw value is handed back verbatim (so nothing is silently dropped),
+			// but surface a notice so the user/caller is not left without any
+			// signal that the date could not be parsed.
+			new Notice(
+				`QuickAdd: "${trimmed}" could not be parsed as a date; using it as-is.`,
+			);
+		}
+		return input;
+	}
+
+	onClose() {
+		// Prevent any pending debounced updates
+		this.isOpen = false;
+
+		// Cancel any pending debounced calls
+		this.updatePreviewDebounced.cancel();
+
+		// If input is empty and we have a default, use the default.
+		// Never for optional prompts (incl. Skip): empty is the answer.
+		if (!this.input.trim() && this.defaultValue && !this.isOptionalPrompt) {
+			this.input = this.defaultValue;
+		}
+
+		super.onClose();
+	}
+}

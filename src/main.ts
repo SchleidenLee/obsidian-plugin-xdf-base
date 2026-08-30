@@ -1,0 +1,768 @@
+/** biome-ignore-all assist/source/organizeImports: Import order is critical to prevent circular dependencies - ChoiceExecutor must load before dependent classes */
+import type { Debouncer } from "obsidian";
+import { Plugin, TFile, debounce } from "obsidian";
+import { QuickAddSettingsTab } from "./quickAddSettingsTab";
+import { DEFAULT_SETTINGS } from "./settings";
+import type { QuickAddSettings } from "./settings";
+import { log } from "./logger/logManager";
+import { ConsoleErrorLogger } from "./logger/consoleErrorLogger";
+import { GuiLogger } from "./logger/guiLogger";
+import { LogManager } from "./logger/logManager";
+import {
+	reportError,
+	reportUnlessCancelled,
+	withErrorHandling,
+} from "./utils/errorUtils";
+import { registerUnhandledRejectionReporter } from "./utils/unhandledRejectionReporter";
+import { openQuickAddSettings } from "./utils/openPluginSettings";
+import { StartupMacroEngine } from "./engine/StartupMacroEngine";
+import { ChoiceExecutor } from "./choiceExecutor";
+import type IChoice from "./types/choices/IChoice";
+import {
+	deleteObsidianCommand,
+	hasTemplateExtension,
+	isPathWithinTemplateFolders,
+	normalizeTemplateFolderPaths,
+} from "./utilityObsidian";
+import { openChoiceLauncher } from "./gui/suggesters/openChoiceLauncher";
+import { QuickAddApi } from "./quickAddApi";
+import migrate from "./migrations/migrate";
+import { settingsStore } from "./settingsStore";
+import { UpdateModal } from "./gui/UpdateModal/UpdateModal";
+import { FieldSuggestionCache } from "./utils/FieldSuggestionCache";
+import { interactivePromptServer } from "./interactive/interactivePromptServer";
+import { parseSemver } from "./utils/semver";
+import {
+	childChoicesOf,
+	dedupeChoicesById,
+	isChoiceLike,
+	resolveChoiceIcon,
+	rootChoicesOf,
+} from "./utils/choiceUtils";
+import { isReservedVariableKey } from "./utils/reservedVariableKeys";
+import { registerQuickAddCliHandlers } from "./cli/registerQuickAddCliHandlers";
+import { autoSyncEnabledProviders } from "./ai/modelSyncService";
+import { QUICK_ADD_COMMAND_LABELS } from "./commandLabels";
+import { PromptPeekSession } from "./gui/promptPeek/PromptPeekSession";
+import { setQuickAddInstance } from "./quickAddInstance";
+import { applyTemplateToNote } from "./engine/applyTemplateToActiveNote";
+import type ITemplateChoice from "./types/choices/ITemplateChoice";
+import type ICaptureChoice from "./types/choices/ICaptureChoice";
+import type { ChoiceEffect } from "./types/ChoiceOutcome";
+import {
+	buildCallbackUrl,
+	buildObsidianOpenUrl,
+	callbackUrls,
+	isCallbackUrlAllowed,
+	parseCallbackTargets,
+	type CallbackTargets,
+} from "./uri/uriCallback";
+import { runTemplateFromFolder } from "./engine/runTemplateFromFolder";
+import { XdfBaseExtension, setXdfBaseInstance } from "./xdf/XdfBaseExtension";
+
+// Parameters prefixed with `value-` get used as named values for the executed choice
+type CaptureValueParameters = { [key in `value-${string}`]?: string };
+
+interface DefinedUriParameters {
+	choice?: string; // Name
+}
+
+// x-callback-url parameters (Apple Shortcuts, etc.). The hyphenated keys arrive
+// verbatim from the obsidian:// query string.
+interface XCallbackParameters {
+	"x-success"?: string;
+	"x-error"?: string;
+	"x-cancel"?: string;
+	"x-callback-url"?: string;
+}
+
+type UriParameters = DefinedUriParameters &
+	CaptureValueParameters &
+	XCallbackParameters;
+
+// The settingsStore subscriber fires on every store change — including high-frequency
+// ones like folder collapse toggles. Coalesce those full-settings disk writes into one
+// per burst (saveData rewrites the whole data.json); flushed on unload so nothing is lost.
+const SETTINGS_SAVE_DEBOUNCE_MS = 1000;
+
+export default class QuickAdd extends Plugin {
+	settings: QuickAddSettings;
+	private unsubscribeSettingsStore: () => void;
+	// XDF-Base 扩展实例（在 onload 末尾初始化，onunload 时清理）
+	private xdfBase: XdfBaseExtension | null = null;
+	// Debounced disk write for the store subscriber. saveSettings() stays immediate
+	// (migrations await it) and cancels this; onunload flushes it.
+	//
+	// The async IIFE is load-bearing, not style: floating `saveData()` straight from a
+	// non-async arrow leaves NO QuickAdd frame on the rejection's stack (it is
+	// constructed inside Obsidian's own FS plumbing, after an await), so a failed
+	// settings write would be invisible to the unhandled-rejection reporter - which is
+	// the one failure here the user most needs to hear about, since their settings
+	// silently did not persist. Awaiting inside a QuickAdd frame puts us on the stack.
+	private requestSave: Debouncer<[], void> = debounce(() => {
+		void (async () => {
+			await this.saveData(this.settings);
+		})();
+	}, SETTINGS_SAVE_DEBOUNCE_MS);
+
+	get api(): ReturnType<typeof QuickAddApi.GetApi> {
+		return QuickAddApi.GetApi(
+			this.app,
+			this,
+			new ChoiceExecutor(this.app, this),
+		);
+	}
+
+	async onload() {
+		log.logMessage("Loading QuickAdd");
+		setQuickAddInstance(this);
+
+		await this.loadSettings();
+		settingsStore.replaceState(this.settings);
+		this.unsubscribeSettingsStore = settingsStore.subscribe((settings) => {
+			this.settings = settings;
+			this.requestSave();
+		});
+
+		this.addCommand({
+			id: "runQuickAdd",
+			name: QUICK_ADD_COMMAND_LABELS.run,
+			callback: () => {
+				openChoiceLauncher(this);
+			},
+		});
+
+		this.addCommand({
+			id: "resumePrompt",
+			name: QUICK_ADD_COMMAND_LABELS.resumePrompt,
+			checkCallback: (checking) => {
+				if (!PromptPeekSession.isPeeking()) return false;
+				if (!checking) PromptPeekSession.getActive()?.resume();
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "runTemplateFromFolder",
+			name: QUICK_ADD_COMMAND_LABELS.runTemplateFromFolder,
+			callback: () => {
+				void runTemplateFromFolder(this.app, this, {
+					choiceExecutor: new ChoiceExecutor(this.app, this),
+				});
+			},
+		});
+
+		this.addCommand({
+			id: "applyTemplateToActiveFile",
+			name: QUICK_ADD_COMMAND_LABELS.applyTemplate,
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const available = file?.extension === "md";
+				if (checking) return available;
+				if (!available) return;
+
+				void applyTemplateToNote(this.app, this, {
+					file,
+					choiceExecutor: new ChoiceExecutor(this.app, this),
+				});
+			},
+		});
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, abstractFile) => {
+				if (!(abstractFile instanceof TFile)) return;
+				if (abstractFile.extension !== "md") return;
+
+				menu.addItem((item) =>
+					item
+						// Aligns with the command-palette label
+						// (QUICK_ADD_COMMAND_LABELS.applyTemplate) so the same action reads
+						// consistently across both surfaces. Obsidian prefixes commands with
+						// "QuickAdd:"; the file menu is unprefixed, so add it here.
+						.setTitle(`QuickAdd: ${QUICK_ADD_COMMAND_LABELS.applyTemplate}`)
+						.setIcon("file-plus")
+						.onClick(() => {
+							void applyTemplateToNote(this.app, this, {
+								file: abstractFile,
+								choiceExecutor: new ChoiceExecutor(this.app, this),
+							});
+						}),
+				);
+			}),
+		);
+
+		this.addCommand({
+			id: "reloadQuickAdd",
+			name: QUICK_ADD_COMMAND_LABELS.reloadDev,
+			checkCallback: (checking) => {
+				if (checking) {
+					return this.settings.devMode;
+				}
+
+				const id: string = this.manifest.id;
+				const plugins = this.app.plugins;
+				void plugins.disablePlugin(id).then(() => plugins.enablePlugin(id));
+			},
+		});
+
+		// Start automatic cleanup for field suggestion cache
+		const cache = FieldSuggestionCache.getInstance();
+		cache.startAutomaticCleanup((intervalId) =>
+			this.registerInterval(intervalId),
+		);
+		cache.registerInvalidationListeners(this.app, (eventRef) =>
+			this.registerEvent(eventRef),
+		);
+
+		this.addCommand({
+			id: "openQuickAddSettings",
+			name: QUICK_ADD_COMMAND_LABELS.openSettings,
+			callback: () => {
+				openQuickAddSettings(this.app, this.manifest.id);
+			},
+		});
+
+		this.registerObsidianProtocolHandler("quickadd", async (e) => {
+			const parameters = e as unknown as UriParameters;
+
+			// Resolve callback targets only when the feature is enabled. With it off (or
+			// no x-* params) we run the exact legacy path — zero behavioural change.
+			const targets: CallbackTargets = this.settings.enableUriCallbacks
+				? parseCallbackTargets(parameters)
+				: { any: false };
+
+			if (!targets.any) {
+				await this.runUriChoiceLegacy(parameters);
+				return;
+			}
+
+			// Validate every provided callback URL BEFORE running anything, so a bad URL
+			// can't half-execute and make an external caller retry (and duplicate work).
+			const disallowed = callbackUrls(targets).filter(
+				(url) => !isCallbackUrlAllowed(url),
+			);
+			if (disallowed.length > 0) {
+				log.logWarning(
+					`QuickAdd URI: ignoring disallowed callback URL(s): ${disallowed.join(", ")}`,
+				);
+				// Notify via x-error only if it is itself allowed; never open a disallowed
+				// URL. Nothing was executed, so the caller can safely retry.
+				if (targets.error && isCallbackUrlAllowed(targets.error)) {
+					this.openUriCallback(targets.error, {
+						status: "error",
+						errorCode: "bad-callback-url",
+					});
+				}
+				return;
+			}
+
+			if (!parameters.choice) {
+				log.logWarning("URI was executed without a `choice` parameter.");
+				this.fireUriError(targets, "choice-not-found");
+				return;
+			}
+
+			const choice = this.getChoice("name", parameters.choice);
+			if (!choice) {
+				log.logWarning(
+					`URI could not find any choice named '${parameters.choice}'`,
+				);
+				this.fireUriError(targets, "choice-not-found");
+				return;
+			}
+
+			// Names are not unique; getChoice returns the FIRST match. Warn so an
+			// ambiguous target is diagnosable rather than silently running the wrong one.
+			this.warnIfChoiceNameAmbiguous(parameters.choice);
+
+			if (choice.type !== "Template" && choice.type !== "Capture") {
+				log.logWarning(
+					`QuickAdd URI x-callback supports Template and Capture choices only ('${choice.name}' is ${choice.type}). ` +
+						`A URI with x-* callback params cannot run a ${choice.type} choice while "Enable URI callbacks" is on; remove the x-* params to run it on the legacy path.`,
+				);
+				this.fireUriError(targets, "unsupported-choice-type");
+				return;
+			}
+
+			const choiceExecutor = new ChoiceExecutor(this.app, this);
+			this.applyUriValueParameters(choiceExecutor, parameters);
+
+			const outcome = await choiceExecutor.executeWithOutcome(
+				choice as ITemplateChoice | ICaptureChoice,
+			);
+
+			switch (outcome.status) {
+				case "success":
+					this.fireUriSuccess(targets, outcome.file, outcome.effect);
+					break;
+				case "cancelled":
+					if (outcome.cancelKind === "user") {
+						this.fireUriCancel(targets);
+					} else {
+						this.fireUriError(targets, "execution-aborted");
+					}
+					break;
+				case "error":
+					this.fireUriError(targets, "execution-failed");
+					break;
+			}
+		});
+
+		log.register(new ConsoleErrorLogger()).register(new GuiLogger(this));
+
+		// Must come after the loggers: a QuickAdd promise that rejects with nobody
+		// awaiting it (a settings click handler, a floated call) used to leave the user
+		// with nothing but a console line. Now it reports through the same channel as
+		// every other failure (#1576).
+		registerUnhandledRejectionReporter(this);
+
+		if (this.settings.enableRibbonIcon) {
+			this.addRibbonIcon("file-plus", "QuickAdd", () => {
+				openChoiceLauncher(this);
+			});
+		}
+
+		this.addSettingTab(new QuickAddSettingsTab(this.app, this));
+
+		// Everything from here on reads the choice tree, i.e. untrusted data.json.
+		// Each step is isolated so a defect in that data costs one capability
+		// instead of the whole plugin: onload throwing leaves Obsidian reporting
+		// only "Plugin failure: quickadd", with no commands, no migrations, no CLI
+		// and no startup macros, and no way for the user to tell why (#1566).
+		// The accessors below handle the corrupt shapes we know about; this is the
+		// blast radius bound for the ones nobody has thought of yet.
+		this.addCommandsForChoices(this.settings.choices);
+
+		try {
+			await migrate(this);
+		} catch (err) {
+			reportError(err, "QuickAdd could not run its settings migrations");
+		}
+
+		const registerCli = () => {
+			try {
+				registerQuickAddCliHandlers(this);
+			} catch (err) {
+				reportError(err, "QuickAdd could not register its CLI handlers");
+			}
+		};
+
+		if (this.app.workspace.layoutReady) {
+			registerCli();
+		} else {
+			this.app.workspace.onLayoutReady(registerCli);
+		}
+
+		// Run startup macros after migrations are complete
+		const launchStartupMacros = async () => {
+			try {
+				await new StartupMacroEngine(
+					this.app,
+					this,
+					this.settings.choices,
+					new ChoiceExecutor(this.app, this),
+				).run();
+			} catch (err) {
+				reportError(err, "QuickAdd could not run its startup macros");
+			}
+		};
+
+		if (this.app.workspace.layoutReady) {
+			void launchStartupMacros();
+		} else {
+			this.app.workspace.onLayoutReady(launchStartupMacros);
+		}
+
+		// Keep AI provider model lists current without plugin releases: a quiet,
+		// daily-throttled background sync for providers that opted in. Deferred
+		// past layout-ready so it never competes with startup work.
+		this.app.workspace.onLayoutReady(() => {
+			window.setTimeout(() => {
+				void autoSyncEnabledProviders(this.app);
+			}, 5_000);
+		});
+
+		this.announceUpdate();
+
+		// ========= XDF-Base 扩展入口 =========
+		// 必须在 onload 最末尾启动，因为前面的初始化（settings、choices、commands）可能依赖数据状态。
+		// 失败也无所谓——XdfBaseExtension 内部会 try/catch + Notice。
+		this.xdfBase = new XdfBaseExtension(this.app, this);
+		setXdfBaseInstance(this.xdfBase);
+		void this.xdfBase.initialize();
+	}
+
+	/** Today's URI behaviour: run the choice, report errors to the log. Used when URI
+	 * callbacks are disabled or no x-* params were provided (backward-compatible). */
+	private async runUriChoiceLegacy(parameters: UriParameters): Promise<void> {
+		if (!parameters.choice) {
+			log.logWarning("URI was executed without a `choice` parameter.");
+			return;
+		}
+		const choice = this.getChoice("name", parameters.choice);
+		if (!choice) {
+			reportError(
+				new Error(
+					`URI could not find any choice named '${parameters.choice}'`,
+				),
+				"URI handler error",
+			);
+			return;
+		}
+		// Choice names are not unique; getChoice returns the FIRST match. Warn the user
+		// (via Notice) when the name is ambiguous so an automation that silently ran the
+		// wrong choice is at least diagnosable.
+		this.warnIfChoiceNameAmbiguous(parameters.choice);
+		const choiceExecutor = new ChoiceExecutor(this.app, this);
+		this.applyUriValueParameters(choiceExecutor, parameters);
+		try {
+			await choiceExecutor.execute(choice);
+		} catch (err) {
+			// Silent for a dismissal: a URI run that opens a prompt the user escapes is
+			// not a failure, and this legacy path has no x-cancel target to tell.
+			reportUnlessCancelled(err, `Could not run "${choice.name}"`);
+		}
+	}
+
+	private applyUriValueParameters(
+		choiceExecutor: ChoiceExecutor,
+		parameters: UriParameters,
+	): void {
+		Object.entries(parameters)
+			.filter(([key]) => key.startsWith("value-"))
+			.forEach(([key, value]) => {
+				const variableName = key.slice(6);
+				// Never let an incoming URI populate a reserved internal variable
+				// (e.g. the capture-target file path): obsidian:// links are reachable
+				// by any webpage/app, so honouring `value-__qa.…` would let an external
+				// caller drive internal plumbing. There is no legitimate URI use for
+				// these keys.
+				if (
+					variableName &&
+					typeof value === "string" &&
+					!isReservedVariableKey(variableName)
+				) {
+					choiceExecutor.variables.set(variableName, value);
+				}
+			});
+	}
+
+	/**
+	 * `effect` rides along with the success callback, unlike `reason`, which this
+	 * handler deliberately withholds on both failure variants.
+	 *
+	 * The rule it is not breaking is "leak no vault detail to an external callback
+	 * URL": `effect` is a three-token enum (`created`/`changed`/`unchanged`) with
+	 * nothing vault-specific in it, and this same callback already carries the note's
+	 * path and the vault name. Withholding it would leave the exact automation #1615
+	 * is about — a Shortcut writing an idempotency marker on `status=success` — still
+	 * marking captures that never happened.
+	 */
+	private fireUriSuccess(
+		targets: CallbackTargets,
+		file: TFile | undefined,
+		effect: ChoiceEffect,
+	): void {
+		const params: Record<string, string> = { status: "success", effect };
+		if (file) {
+			params.path = file.path;
+			params.url = buildObsidianOpenUrl(this.app.vault.getName(), file.path);
+		}
+		if (targets.success) this.openUriCallback(targets.success, params);
+	}
+
+	private fireUriError(targets: CallbackTargets, errorCode: string): void {
+		if (targets.error) {
+			this.openUriCallback(targets.error, { status: "error", errorCode });
+		}
+	}
+
+	private fireUriCancel(targets: CallbackTargets): void {
+		if (targets.cancel) {
+			this.openUriCallback(targets.cancel, { status: "cancel" });
+		}
+	}
+
+	/** Opens a callback URL with the result params appended. No-throw, no-recursion:
+	 * a failed window.open must never break the (already-completed) choice or fire
+	 * another callback. */
+	private openUriCallback(url: string, params: Record<string, string>): void {
+		withErrorHandling(() => {
+			window.open(buildCallbackUrl(url, params));
+		}, "QuickAdd URI: failed to open callback URL");
+	}
+
+	onunload() {
+		log.logMessage("Unloading QuickAdd");
+		// Flush any pending debounced settings write so a just-made change (e.g. a
+		// folder collapse) is never lost on plugin reload / app quit.
+		this.requestSave.run();
+		this.unsubscribeSettingsStore?.call(this);
+
+		// Clear the error log to prevent memory leaks
+		LogManager.loggers.forEach((logger) => {
+			if (logger instanceof ConsoleErrorLogger) {
+				logger.clearErrorLog();
+			}
+		});
+
+		// Clean up field suggestion cache
+		const cache = FieldSuggestionCache.getInstance();
+		cache.destroy();
+
+		// Stop the interactive-prompt bridge (closes the localhost server and drops
+		// any in-flight sessions) so nothing keeps listening after unload.
+		interactivePromptServer.stop();
+		PromptPeekSession.getActive()?.cancel();
+
+		// XDF-Base 清理（关数据库、停事件监听）
+		if (this.xdfBase) {
+			void this.xdfBase.cleanup();
+			this.xdfBase = null;
+		}
+	}
+
+	async loadSettings() {
+		const loadedData = await this.loadData();
+		const settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			loadedData,
+		) as QuickAddSettings & {
+			announceUpdates: QuickAddSettings["announceUpdates"] | boolean;
+		};
+
+		if (typeof settings.announceUpdates === "boolean") {
+			settings.announceUpdates = settings.announceUpdates ? "all" : "none";
+		}
+
+		// Heal duplicate choice ids (#1451): a repeated id makes the settings tab's
+		// keyed {#each} throw each_key_duplicate and render blank (commands keep
+		// working, so it looks like "corrupted data"). Cheap and idempotent, so it
+		// runs every load; the next ordinary save rewrites data.json cleaned. No
+		// data is lost - see dedupeChoicesById. Only touch a real array: a missing
+		// `choices` already defaults to [] via the merge above, and a null/corrupt
+		// value is left exactly as-is rather than being silently replaced with []
+		// (which a later save would persist, destroying recoverable data).
+		if (Array.isArray(settings.choices)) {
+			settings.choices = dedupeChoicesById(settings.choices);
+		}
+
+		this.settings = settings;
+	}
+
+	async saveSettings() {
+		// Immediate, awaitable write (migrations rely on this). Supersede any pending
+		// debounced write so the same settings aren't redundantly rewritten after.
+		this.requestSave.cancel();
+		await this.saveData(this.settings);
+	}
+
+	private addCommandsForChoices(choices: IChoice[]) {
+		for (const choice of rootChoicesOf(choices)) {
+			// A list entry can be a hole (`null`, a stray primitive) left by a bad
+			// edit or a truncated write; it is not a choice, so there is no command
+			// to register for it.
+			if (!isChoiceLike(choice)) continue;
+			// Fault-isolate the loop. This runs from onload against untrusted
+			// data.json, and everything after it - migrations, the CLI handlers,
+			// startup macros - used to be lost to a single bad choice (#1566: a
+			// folder with no `choices` key took the whole plugin down with
+			// "Plugin failure: quickadd"). One defect should cost one command.
+			try {
+				this.addCommandForChoice(choice);
+			} catch (err) {
+				reportError(err, `Could not add a command for a QuickAdd choice`);
+			}
+		}
+	}
+
+	public addCommandForChoice(choice: IChoice) {
+		if (choice.type === "Multi") {
+			this.addCommandsForChoices(childChoicesOf(choice));
+		}
+
+		if (choice.command) {
+			const choiceId = choice.id;
+
+			this.addCommand({
+				id: `choice:${choiceId}`,
+				name: choice.name,
+				icon: resolveChoiceIcon(choice),
+				callback: async () => {
+					// Resolved outside the try so the failure can name the choice the user
+					// actually ran; a bare UUID tells them nothing. Falls back to the name
+					// captured at registration when the lookup itself is what failed.
+					let current: IChoice | undefined;
+					try {
+						current = this.getChoiceById(choiceId);
+						await new ChoiceExecutor(this.app, this).execute(current);
+					} catch (err) {
+						// The outermost handler: the last chance to say which choice failed.
+						// It reports only what nothing below it already reported (#1601), and
+						// stays silent when the user simply dismissed a prompt - Escape on the
+						// one-page input modal used to raise a 15-second ERROR notice here.
+						reportUnlessCancelled(
+							err,
+							`Could not run "${current?.name ?? choice.name}"`,
+						);
+					}
+				},
+			});
+		}
+	}
+
+	public getChoiceById(choiceId: string): IChoice {
+		const choice = this.getChoice("id", choiceId);
+
+		if (!choice) {
+			throw new Error(`Choice ${choiceId} not found`);
+		}
+
+		return choice;
+	}
+
+	public getChoiceByName(choiceName: string): IChoice {
+		const choice = this.getChoice("name", choiceName);
+
+		if (!choice) {
+			throw new Error(`Choice ${choiceName} not found`);
+		}
+
+		return choice;
+	}
+
+	private getChoice(
+		by: "name" | "id",
+		targetPropertyValue: string,
+		choices: IChoice[] = this.settings.choices,
+	): IChoice | null {
+		for (const choice of rootChoicesOf(choices)) {
+			if (!isChoiceLike(choice)) continue;
+			if (choice[by] === targetPropertyValue) {
+				return choice;
+			}
+			if (choice.type === "Multi") {
+				const subChoice = this.getChoice(
+					by,
+					targetPropertyValue,
+					childChoicesOf(choice),
+				);
+				if (subChoice) {
+					return subChoice;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	/** Count how many choices anywhere in the tree carry `name` (names aren't unique).
+	 * Choices hidden inside an unreadable `choices` value are not counted - the
+	 * warning this feeds can only ever under-report, never mis-fire. */
+	private countChoicesByName(
+		name: string,
+		choices: IChoice[] = this.settings.choices,
+	): number {
+		let count = 0;
+		for (const choice of rootChoicesOf(choices)) {
+			if (!isChoiceLike(choice)) continue;
+			if (choice.name === name) count++;
+			if (choice.type === "Multi") {
+				count += this.countChoicesByName(name, childChoicesOf(choice));
+			}
+		}
+		return count;
+	}
+
+	/** Surface a Notice when a URI's `choice=<name>` is ambiguous, so an automation
+	 * that ran the wrong (first-matching) choice is at least diagnosable. */
+	private warnIfChoiceNameAmbiguous(name: string): void {
+		const matches = this.countChoicesByName(name);
+		if (matches > 1) {
+			log.logWarning(
+				`QuickAdd URI: ${matches} choices are named '${name}'. Ran the first match — rename choices to keep names unique so URIs target the right one.`,
+			);
+		}
+	}
+
+	public removeCommandForChoice(
+		choice: IChoice,
+		options?: { recursive?: boolean },
+	) {
+		// Recurse ONLY when the whole subtree is going away (a folder DELETE):
+		// a Multi (folder) registers commands for its command-enabled descendants,
+		// so tearing it down must remove theirs too, or deleting a folder leaves
+		// orphaned palette entries that throw "Choice <id> not found" when invoked.
+		//
+		// Do NOT recurse when only the folder's OWN command is being removed (e.g.
+		// toggling the folder's command off, or the remove half of an update): the
+		// children remain and their still-enabled commands must stay registered.
+		if (options?.recursive && choice.type === "Multi") {
+			for (const child of childChoicesOf(choice)) {
+				if (!isChoiceLike(child)) continue;
+				this.removeCommandForChoice(child, options);
+			}
+		}
+
+		deleteObsidianCommand(this.app, `quickadd:choice:${choice.id}`);
+	}
+
+	public getTemplateFiles(): TFile[] {
+		const folders = normalizeTemplateFolderPaths(
+			this.settings.templateFolderPaths,
+		);
+		// Only files the engine can actually resolve are useful suggestions; an
+		// empty folder list means "suggest every template file in the vault".
+		return this.app.vault
+			.getFiles()
+			.filter((file) => hasTemplateExtension(file.path))
+			.filter((file) => isPathWithinTemplateFolders(file.path, folders));
+	}
+
+	private announceUpdate() {
+		// `isFeatureUpdate`: the "major" announce tier promises "new features, breaking
+		// changes". QuickAdd ships features as semantic-release feat: commits, which become
+		// MINOR bumps (e.g. 2.13.x -> 2.14.0), never MAJOR — so gating purely on the major
+		// digit (isMajorUpdate) would suppress the modal for every feature release. Treat a
+		// major OR minor increase as a feature update so feature releases are announced as
+		// documented, while patch-only bumps stay quiet. Unparseable versions fall back to
+		// showing the update (mirrors isMajorUpdate's err-on-the-side-of-showing default).
+		const isFeatureUpdate = (
+			currentVersion: string,
+			previousVersion: string,
+		): boolean => {
+			const current = parseSemver(currentVersion);
+			const previous = parseSemver(previousVersion);
+			if (!current || !previous) return true;
+			if (current.major !== previous.major)
+				return current.major > previous.major;
+			return current.minor > previous.minor;
+		};
+
+		const currentVersion = this.manifest.version;
+		const knownVersion = this.settings.version;
+
+		if (currentVersion === knownVersion) return;
+
+		const preference = this.settings.announceUpdates;
+		let shouldAnnounce = true;
+
+		if (preference === "none") {
+			shouldAnnounce = false;
+		} else if (
+			preference === "major" &&
+			!isFeatureUpdate(currentVersion, knownVersion)
+		) {
+			shouldAnnounce = false;
+		}
+
+		this.settings.version = currentVersion;
+		void this.saveSettings();
+
+		if (!shouldAnnounce) return;
+
+		const updateModal = new UpdateModal(this.app, knownVersion);
+		updateModal.open();
+	}
+}

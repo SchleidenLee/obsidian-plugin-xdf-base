@@ -1,0 +1,183 @@
+import { Choice } from "./Choice";
+import type ICaptureChoice from "./ICaptureChoice";
+import type {
+	BlankLineAfterMatchMode,
+	SectionOrdering,
+} from "./ICaptureChoice";
+import { CREATE_IF_NOT_FOUND_ORDERED } from "../../constants";
+import type { OpenLocation, FileViewMode2 } from "../fileOpening";
+import type { AppendLinkOptions } from "../linkPlacement";
+import { normalizeFileOpening } from "../../utils/fileOpeningDefaults";
+
+export class CaptureChoice extends Choice implements ICaptureChoice {
+	appendLink: boolean | AppendLinkOptions;
+	copyLinkToClipboard: boolean;
+	captureTo: string;
+	captureToActiveFile: boolean;
+	captureToCanvasNodeId: string;
+	activeFileWritePosition: "cursor" | "top" | "bottom";
+	createFileIfItDoesntExist: {
+		enabled: boolean;
+		createWithTemplate: boolean;
+		template: string;
+	};
+	format: { enabled: boolean; format: string };
+	useSelectionAsCaptureValue?: boolean;
+	insertAfter: {
+		enabled: boolean;
+		after: string;
+		insertAtEnd: boolean;
+		considerSubsections: boolean;
+		createIfNotFound: boolean;
+		createIfNotFoundLocation: string;
+		inline?: boolean;
+		replaceExisting?: boolean;
+		blankLineAfterMatchMode?: BlankLineAfterMatchMode;
+		orderBy?: SectionOrdering;
+		promptHeading?: boolean;
+	};
+	insertBefore: {
+		enabled: boolean;
+		before: string;
+		createIfNotFound: boolean;
+		createIfNotFoundLocation: string;
+	};
+	newLineCapture: {
+		enabled: boolean;
+		direction: "above" | "below";
+	};
+	prepend: boolean;
+	task: boolean;
+	openFile: boolean;
+	fileOpening: {
+		location: OpenLocation;
+		direction: "vertical" | "horizontal";
+		mode: FileViewMode2;
+		focus: boolean;
+	};
+	templater?: {
+		afterCapture?: "none" | "wholeFile";
+	};
+
+	constructor(name: string) {
+		super(name, "Capture");
+
+		this.appendLink = false;
+		this.copyLinkToClipboard = false;
+		this.captureTo = "";
+		this.captureToActiveFile = false;
+		this.captureToCanvasNodeId = "";
+		this.activeFileWritePosition = "cursor";
+		this.createFileIfItDoesntExist = {
+			enabled: false,
+			createWithTemplate: false,
+			template: "",
+		};
+		this.format = { enabled: false, format: "" };
+		this.insertAfter = {
+			enabled: false,
+			after: "",
+			insertAtEnd: false,
+			considerSubsections: false,
+			createIfNotFound: false,
+			createIfNotFoundLocation: "top",
+			inline: false,
+			replaceExisting: false,
+			blankLineAfterMatchMode: "auto",
+			promptHeading: false,
+		};
+		this.insertBefore = {
+			enabled: false,
+			before: "",
+			createIfNotFound: false,
+			createIfNotFoundLocation: "top",
+		};
+		this.newLineCapture = {
+			enabled: false,
+			direction: "below",
+		};
+		this.prepend = false;
+		this.task = false;
+		this.openFile = false;
+		this.fileOpening = normalizeFileOpening();
+		this.templater = {
+			afterCapture: "none",
+		};
+	}
+
+	public static Load(choice: ICaptureChoice): CaptureChoice {
+		const loaded = choice as CaptureChoice;
+		// Ensure backward compatibility: default to "cursor" if not set
+		if (
+			loaded.activeFileWritePosition !== "cursor" &&
+			loaded.activeFileWritePosition !== "top" &&
+			loaded.activeFileWritePosition !== "bottom"
+		) {
+			loaded.activeFileWritePosition = "cursor";
+		}
+		if (typeof loaded.captureToCanvasNodeId !== "string") {
+			loaded.captureToCanvasNodeId = "";
+		}
+		if (!loaded.insertBefore) {
+			loaded.insertBefore = {
+				enabled: false,
+				before: "",
+				createIfNotFound: false,
+				createIfNotFoundLocation: "top",
+			};
+		}
+		if (
+			loaded.captureToActiveFile &&
+			loaded.prepend &&
+			!loaded.insertAfter?.enabled &&
+			!loaded.insertBefore.enabled &&
+			!loaded.newLineCapture?.enabled
+		) {
+			if (loaded.activeFileWritePosition !== "top") {
+				loaded.activeFileWritePosition = "bottom";
+			}
+			loaded.prepend = false;
+		}
+		if (!loaded.templater) loaded.templater = { afterCapture: "none" };
+		if (loaded.templater.afterCapture !== "wholeFile") {
+			loaded.templater.afterCapture = "none";
+		}
+		if (loaded.insertAfter && !loaded.insertAfter.blankLineAfterMatchMode) {
+			loaded.insertAfter.blankLineAfterMatchMode = "auto";
+		}
+		if (loaded.insertAfter && loaded.insertAfter.inline === undefined) {
+			loaded.insertAfter.inline = false;
+		}
+		if (loaded.insertAfter && loaded.insertAfter.replaceExisting === undefined) {
+			loaded.insertAfter.replaceExisting = false;
+		}
+		if (loaded.insertAfter && loaded.insertAfter.promptHeading === undefined) {
+			loaded.insertAfter.promptHeading = false;
+		}
+		// Ordered create-location needs an ordering descriptor; backfill a safe
+		// insertion default so the formatter never dereferences undefined for a
+		// hand-edited or imported "ordered" choice (issue #481). The builder owns
+		// date auto-detection, so imported configs stay on the parser-free default.
+		if (
+			loaded.insertAfter?.createIfNotFoundLocation ===
+			CREATE_IF_NOT_FOUND_ORDERED
+		) {
+			// Only backfill orderBy when ordered placement is actually active, so an
+			// inert config (ordered location selected but create-if-not-found off) is
+			// not mutated on load (avoids needless persisted-diff churn).
+			if (loaded.insertAfter.createIfNotFound && !loaded.insertAfter.orderBy) {
+				loaded.insertAfter.orderBy = {
+					by: "insertion",
+					direction: "desc",
+					unparseable: "bottom",
+				};
+			}
+			// Ordered always creates a heading on its own line; inline same-line
+			// insertion is mutually exclusive (the inline create path can't honor
+			// "ordered" and would abort). Enforce the UI invariant here too so a
+			// hand-edited/imported inline+ordered choice can't reach that abort.
+			loaded.insertAfter.inline = false;
+		}
+		return loaded;
+	}
+}

@@ -1,0 +1,86 @@
+export type YamlRange = [number, number] | null;
+
+export interface YamlMatchContext {
+  isInYaml: boolean;
+  isQuoted: boolean;
+  lineStart: number;
+  lineEnd: number;
+  baseIndent: string;
+  isKeyValuePosition: boolean;
+  /**
+   * True when the match is the SOLE value of a YAML list item, i.e. the line is
+   * `- {{match}}` (optionally indented / wrapped in quotes). Mirrors
+   * isKeyValuePosition for the `- value` shape so a consumer can tell a list
+   * item value apart from prose that merely starts with a dash.
+   */
+  isListItemPosition: boolean;
+}
+
+/** Finds the YAML front matter range. Returns [start, end] or null. */
+export function findYamlFrontMatterRange(input: string): YamlRange {
+  const frontMatterRegex = /^(\s*---\r?\n)([\s\S]*?)(\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$))/;
+  const match = frontMatterRegex.exec(input);
+  if (!match) return null;
+  return [0, match[0].length];
+}
+
+/**
+ * Determines if a placeholder lies within YAML and in a key-value position.
+ */
+export function getYamlContextForMatch(
+  input: string,
+  matchStart: number,
+  matchEnd: number,
+  yamlRange: YamlRange,
+): YamlMatchContext {
+  const [yamlStart, yamlEnd] = yamlRange ?? [Number.NaN, Number.NaN];
+  const isInYaml = yamlRange !== null && matchStart >= yamlStart && matchStart <= yamlEnd;
+  if (!isInYaml) {
+    return {
+      isInYaml: false,
+      isQuoted: false,
+      lineStart: 0,
+      lineEnd: 0,
+      baseIndent: "",
+      isKeyValuePosition: false,
+      isListItemPosition: false,
+    };
+  }
+
+  const lineStart = input.lastIndexOf("\n", matchStart - 1) + 1;
+	// A match may span several lines, as an inline `js quickadd` fence does.
+	// Find the end of the line containing the match's END so sole-value checks
+	// can see a suffix after the closing fence. Using matchStart here silently
+	// treated `key: <multiline match> suffix` as a sole property value.
+	const lineEndIdx = input.indexOf("\n", Math.max(matchStart, matchEnd));
+  const lineEnd = lineEndIdx === -1 ? input.length : lineEndIdx;
+
+  const before = input.slice(lineStart, matchStart);
+  const after = input.slice(matchEnd, lineEnd);
+
+  const baseIndent = (before.match(/^\s*/) || [""])[0];
+
+  const isQuoted =
+    (input[matchStart - 1] === '"' && input[matchEnd] === '"') ||
+    (input[matchStart - 1] === "'" && input[matchEnd] === "'");
+
+  const beforeTrimmed = before.replace(/["']$/, "");
+  const afterTrimmed = after.replace(/^["']/, "");
+  // A trailing YAML comment (` #…`) is not part of the scalar, so a token
+  // followed only by a comment is still the sole value of its key / list item.
+  const afterIsSoleValue =
+    afterTrimmed.replace(/\s+#.*$/, "").trim().length === 0;
+  const isKeyValuePosition = /:\s*$/.test(beforeTrimmed) && afterIsSoleValue;
+  // `- {{match}}` (optionally indented / quoted) and nothing else on the line.
+  const isListItemPosition = /^\s*-\s*$/.test(beforeTrimmed) && afterIsSoleValue;
+
+  return {
+    isInYaml: true,
+    isQuoted,
+    lineStart,
+    lineEnd,
+    baseIndent,
+    isKeyValuePosition,
+    isListItemPosition,
+  };
+}

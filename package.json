@@ -1,0 +1,81 @@
+{
+	"name": "quickadd",
+	"version": "2.23.0",
+	"description": "Quickly add new pages or content to your vault.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"lint": "eslint .",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"build-with-lint": "tsc -noEmit -skipLibCheck && pnpm lint && node esbuild.config.mjs production",
+		"check": "svelte-check --threshold error",
+		"obsidian:e2e": "obsidian-e2e run",
+		"provision:e2e-vault": "obsidian-e2e provision",
+		"start:e2e-obsidian": "obsidian-e2e start",
+		"stop:e2e-obsidian": "obsidian-e2e stop",
+		"test": "vitest run --config vitest.config.mts --passWithNoTests",
+		"test:coverage": "vitest run --config vitest.config.mts --coverage",
+		"test:e2e": "vitest run --config vitest.e2e.config.mts",
+		"test:e2e:orb": ".agents/run-e2e"
+	},
+	"keywords": [],
+	"author": "Christian B. B. Houmann",
+	"license": "MIT",
+	"devDependencies": {
+		"@sveltejs/vite-plugin-svelte": "^7.3.0",
+		"@testing-library/jest-dom": "^7.0.1",
+		"@testing-library/svelte": "^5.4.2",
+		"@testing-library/user-event": "^14.6.5",
+		"@types/node": "^26.2.0",
+		"@typescript-eslint/eslint-plugin": "^8.67.0",
+		"@typescript-eslint/parser": "^8.67.0",
+		"@vitest/coverage-v8": "4.1.11",
+		"esbuild": "^0.28.2",
+		"esbuild-svelte": "^0.9.5",
+		"eslint": "10",
+		"eslint-plugin-svelte": "^3.23.0",
+		"globals": "17",
+		"jsdom": "30",
+		"moment": "2.30.1",
+		"obsidian": "1.13.1",
+		"obsidian-e2e": "^0.10.0",
+		"svelte": "^5",
+		"svelte-check": "^4",
+		"svelte-eslint-parser": "^1.8.1",
+		"svelte-preprocess": "^6.0.5",
+		"tslib": "^2.8.1",
+		"typescript": "^6.0.3",
+		"vite": "^8.2.2",
+		"vitest": "^4.1.11"
+	},
+	"dependencies": {
+		"@popperjs/core": "^2.11.8",
+		"chrono-node": "^2.10.1",
+		"fuse.js": "7",
+		"obsidian-dataview": "^0.5.68",
+		"svelte-dnd-action": "0.9.78",
+		"three-way-merge": "^0.1.0",
+		"uuid": "14",
+		"zustand": "^5.0.15",
+		"sql.js": "^1.10.3"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/chhoumann/quickadd.git"
+	},
+	"engines": {
+		"node": "^20.19.0 || >=22.12.0"
+	},
+	"packageManager": "pnpm@10.32.1+sha512.a706938f0e89ac1456b6563eab4edf1d1faf3368d1191fc5c59790e96dc918e4456ab2e67d613de1043d2e8c81f87303e6b40d4ffeca9df15ef1ad567348f2be",
+	"pnpm": {
+		"onlyBuiltDependencies": [
+			"@codemirror/language",
+			"esbuild"
+		],
+		"overrides": {
+			"brace-expansion": "5.0.9",
+			"obsidian-calendar-ui>svelte": "^5.56.3",
+			"postcss": "8.5.25"
+		}
+	}
+}

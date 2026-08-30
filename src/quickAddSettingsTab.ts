@@ -1,0 +1,906 @@
+import type {
+	App,
+	Setting,
+	SettingDefinitionGroup,
+	SettingDefinitionItem,
+	TextAreaComponent,
+} from "obsidian";
+import {
+	ButtonComponent,
+	ExtraButtonComponent,
+	Notice,
+	PluginSettingTab,
+	TextComponent,
+} from "obsidian";
+import type QuickAdd from "./main";
+import type IChoice from "./types/choices/IChoice";
+import ChoiceView from "./gui/choiceList/ChoiceView.svelte";
+import ChoicesUnavailable from "./gui/choiceList/ChoicesUnavailable.svelte";
+import { mountComponent, type MountHandle } from "./gui/svelte/mountComponent";
+import type { Plain } from "./gui/svelte/persist.svelte";
+import { GenericTextSuggester } from "./gui/suggesters/genericTextSuggester";
+import GlobalVariablesView from "./gui/GlobalVariables/GlobalVariablesView.svelte";
+import { settingsStore } from "./settingsStore";
+import {
+	getAllFolderPathsInVault,
+	normalizeTemplateFolderPaths,
+} from "./utilityObsidian";
+import { sortFolderPathsByTree } from "./utils/folder-sorting";
+import { ExportPackageModal } from "./gui/PackageManager/ExportPackageModal";
+import { ImportPackageModal } from "./gui/PackageManager/ImportPackageModal";
+import { InputPromptDraftStore } from "./utils/InputPromptDraftStore";
+import type { QuickAddSettings } from "./settings";
+import {
+	DEFAULT_DATE_ALIASES,
+	formatDateAliasLines,
+	parseDateAliasLines,
+} from "./utils/dateAliases";
+import { renderDevelopmentInfo } from "./quickAddSettingsDevelopmentInfo";
+import { createDocsLink, DOCS_URLS, openDocsUrl } from "./docs";
+import { rootChoicesOf } from "./utils/choiceUtils";
+import { getXdfBaseInstance } from "./xdf/XdfBaseExtension";
+import { ScriptReleaser } from "./xdf/scripts/ScriptReleaser";
+
+/** String-named keys of {@link QuickAddSettings} — used to type the declarative
+ * `control` keys so a mistyped key is caught at compile time. */
+type SettingsKey = Extract<keyof QuickAddSettings, string>;
+
+/**
+ * Shared by the Packages definition (which is what the settings search indexes)
+ * and by the rendered description (which the row rewrites as the export state
+ * changes), so the two can never drift.
+ */
+const PACKAGES_DESC =
+	"Bundle or import QuickAdd automations as reusable packages.";
+
+export class QuickAddSettingsTab extends PluginSettingTab {
+	public plugin: QuickAdd;
+	private choiceViewHandle: MountHandle | null = null;
+	private globalVariablesViewHandle: MountHandle | null = null;
+	/** Live store subscription behind the Packages row's Export state. */
+	private packagesUnsubscribe: (() => void) | null = null;
+
+	constructor(app: App, plugin: QuickAdd) {
+		super(app, plugin);
+		this.plugin = plugin;
+		this.icon = "zap";
+	}
+
+	// -----------------------------------------------------------------------
+	// Store bridge
+	//
+	// QuickAdd's single source of truth is the zustand `settingsStore`, and the
+	// only persistence path is the subscriber installed in main.ts (which sets
+	// `plugin.settings` and calls `saveSettings()` on every store change). The
+	// declarative `control` API would otherwise bind directly to
+	// `plugin.settings[key]` and call `saveData` itself, bypassing the store and
+	// leaving every live store consumer (formatter, dateParser, choiceExecutor,
+	// the AI command, the Svelte views, ...) stale. Overriding both accessors to
+	// read/write the store keeps it authoritative. We must NOT also touch
+	// `plugin.settings` or call `saveData` here — the subscriber owns that.
+	// -----------------------------------------------------------------------
+
+	override getControlValue(key: string): unknown {
+		const state = settingsStore.getState();
+
+		// `inputPrompt` is stored as an enum but surfaced as a boolean toggle.
+		if (key === "inputPrompt") {
+			return state.inputPrompt === "multi-line";
+		}
+
+		return state[key as keyof QuickAddSettings];
+	}
+
+	override setControlValue(key: string, value: unknown): void {
+		if (key === "inputPrompt") {
+			settingsStore.setState({
+				inputPrompt: value ? "multi-line" : "single-line",
+			});
+			return;
+		}
+
+		if (key === "persistInputPromptDrafts") {
+			const enabled = Boolean(value);
+			settingsStore.setState({ persistInputPromptDrafts: enabled });
+			if (!enabled) {
+				InputPromptDraftStore.getInstance().clearAll();
+			}
+			return;
+		}
+
+		settingsStore.setState({ [key]: value } as Partial<QuickAddSettings>);
+	}
+
+	override getSettingDefinitions(): SettingDefinitionItem<SettingsKey>[] {
+		const groups: SettingDefinitionGroup<SettingsKey>[] = [
+			this.choicesAndPackagesGroup(),
+			this.choicePickerGroup(),
+			this.inputGroup(),
+			this.templatesGroup(),
+			this.notificationsGroup(),
+			this.globalVariablesGroup(),
+			this.aiGroup(),
+			this.databaseGroup(),
+			this.appearanceGroup(),
+		];
+
+		if (__IS_DEV_BUILD__) {
+			groups.push(this.developerGroup());
+		}
+
+		return groups;
+	}
+
+	override hide(): void {
+		// In declarative mode the framework owns row teardown — unloading the
+		// control Components and running each render def's cleanup closure —
+		// which the base hide() drives. We must call it (the old imperative tab
+		// emptied containerEl itself, so the missing super.hide() was harmless
+		// then; it is not now). destroySettingViews() is the idempotent safety
+		// net for the two Svelte mounts.
+		super.hide();
+		this.destroySettingViews();
+	}
+
+	private destroySettingViews(): void {
+		this.choiceViewHandle?.destroy();
+		this.choiceViewHandle = null;
+		this.globalVariablesViewHandle?.destroy();
+		this.globalVariablesViewHandle = null;
+		// Safety net for the Packages subscription: the render cleanup already
+		// unsubscribes, but this row outlives no view of its own, so a missed
+		// cleanup would leak a listener for the plugin's lifetime.
+		this.packagesUnsubscribe?.();
+		this.packagesUnsubscribe = null;
+	}
+
+	// ----- group builders -----
+
+	private choicesAndPackagesGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Choices & packages",
+			// QuickAdd's power surface is syntax you have to learn ({{VALUE}},
+			// {{DATE}}, capture targets, ...) and until now the manual was reachable
+			// from exactly one place in the whole plugin (issue #1541). A help icon
+			// on the first heading is Obsidian's own idiom for this, and it costs the
+			// page no vertical space, so the choices list stays the focus.
+			extraButtons: [
+				(button) =>
+					button
+						.setIcon("help-circle")
+						.setTooltip("QuickAdd documentation")
+						.onClick(() =>
+							openDocsUrl(DOCS_URLS.gettingStarted, button.extraSettingsEl),
+						),
+			],
+			items: [
+				{
+					name: "Choices",
+					render: (setting) => this.renderChoicesView(setting),
+				},
+				{
+					name: "Packages",
+					desc: PACKAGES_DESC,
+					render: (setting) => this.renderPackages(setting),
+				},
+			],
+		};
+	}
+
+	private choicePickerGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Choice picker",
+			items: [
+				{
+					name: "Search nested choices",
+					// "Multi" is the internal type id; every other user-facing string
+					// says folder (see src/utils/choiceNoun.ts), and this was the one
+					// place in the whole settings surface that leaked it.
+					desc: "When searching in the choice picker, also match choices nested inside folders and show their path. Note that nested matches can outrank same-level ones. Disable to search only the open level.",
+					control: { type: "toggle", key: "searchNestedChoices" },
+				},
+				{
+					name: "“New note from template” in the launcher",
+					desc: "Add a row to Run QuickAdd that lists templates from your configured template folder, so you can create a note from a template without a dedicated Template choice. Only appears when a template folder is configured; the command palette entry works regardless.",
+					control: {
+						type: "dropdown",
+						key: "templateFolderLauncherRow",
+						defaultValue: "bottom",
+						options: {
+							bottom: "Show at the bottom (keeps your top choice first)",
+							top: "Show at the top",
+							off: "Hide",
+						},
+					},
+				},
+			],
+		};
+	}
+
+	private inputGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Input",
+			items: [
+				{
+					name: "Use multi-line input prompt",
+					desc: "Use multi-line input prompt instead of single-line input prompt. Submit multi-line prompts with Ctrl/Cmd+Enter; Enter inserts a newline.",
+					control: { type: "toggle", key: "inputPrompt" },
+				},
+				{
+					name: "Persist input prompt drafts",
+					desc: "Keep drafts when closing input prompts so they can be restored on reopen. Drafts are stored only for this session.",
+					control: { type: "toggle", key: "persistInputPromptDrafts" },
+				},
+				{
+					name: "Use editor selection as default Capture value",
+					desc: "When enabled, Capture uses the current editor selection as {{VALUE}} and may skip the prompt. When disabled, Capture always prompts for {{VALUE}}.",
+					control: { type: "toggle", key: "useSelectionAsCaptureValue" },
+				},
+				{
+					name: "One-page input for choices",
+					// The trailing sentence used to read "See One-page Inputs in the
+					// docs." as plain, unlinked prose (issue #1541).
+					desc: this.descWithDocsLink(
+						"Collect a choice's inputs in one form before it runs, instead of one prompt at a time. Works with Template and Capture choices, and with Macros whose scripts declare inputs. Template and Capture choices can override this individually. ",
+						DOCS_URLS.onePageInputs,
+						"Learn more about one-page inputs",
+					),
+					control: { type: "toggle", key: "onePageInputEnabled" },
+				},
+				{
+					name: "Date aliases",
+					desc:
+						"Shortcodes for natural language date parsing. " +
+						"One per line: alias = phrase. Example: tm = tomorrow.",
+					render: (setting) => this.renderDateAliases(setting),
+				},
+			],
+		};
+	}
+
+	private templatesGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Templates & properties",
+			items: [
+				{
+					name: "Template folder paths",
+					desc: "Folders where templates are stored. Used to suggest template files when configuring QuickAdd. Add as many as you like; leave empty to suggest every template file in the vault.",
+					render: (setting) => this.renderTemplateFolderPaths(setting),
+				},
+				{
+					name: "Convert string front matter variables to typed properties (Beta)",
+					desc:
+						"List/object values from scripts are always written as proper Obsidian properties (a list becomes a List). " +
+						"This toggle additionally converts string values into typed properties: a comma or bullet-list string becomes a List, " +
+						"\"42\" becomes a Number, \"true\" becomes a Checkbox, etc. Disabled by default; the string conversion is a beta heuristic that may have edge cases.",
+					control: { type: "toggle", key: "enableTemplatePropertyTypes" },
+				},
+			],
+		};
+	}
+
+	private notificationsGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Notifications",
+			items: [
+				{
+					name: "Announce updates",
+					desc: "Display release notes when a new version is installed. This includes new features, demo videos, and bug fixes.",
+					control: {
+						type: "dropdown",
+						key: "announceUpdates",
+						defaultValue: "major",
+						options: {
+							all: "Show updates on each new release",
+							major:
+								"Show updates only on major releases (new features, breaking changes)",
+							none: "Don't show",
+						},
+					},
+				},
+				{
+					name: "Show capture notifications",
+					desc: "Display a notification when content is captured successfully to confirm the operation completed.",
+					control: { type: "toggle", key: "showCaptureNotification" },
+				},
+				{
+					name: "Show input cancellation notifications",
+					desc: "Display a notification when an input prompt is cancelled without submitting. Disable this to avoid extra notices when dismissing prompts.",
+					control: {
+						type: "toggle",
+						key: "showInputCancellationNotification",
+					},
+				},
+			],
+		};
+	}
+
+	private globalVariablesGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Global variables",
+			items: [
+				{
+					name: "Global variables",
+					render: (setting) => this.renderGlobalVariablesView(setting),
+				},
+			],
+		};
+	}
+
+	private aiGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "AI",
+			items: [
+				{
+					name: "Disable AI & online features",
+					desc: "When on, script calls to `quickAddApi.ai.prompt()` are rejected and no AI provider requests are made. Off by default — scripts that use AI expect it to work.",
+					control: { type: "toggle", key: "disableOnlineFeatures" },
+				},
+			],
+		};
+	}
+
+	private databaseGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Database",
+			items: [
+				{
+					name: "Database status",
+					desc: "XDF-Base synchronizes a SQLite database (stored at .xdf/xdf.db) with the vault. The schema is not defined yet; once it lands, rebuild will repopulate tables from every markdown file.",
+					render: (setting) => this.renderDatabasePanel(setting),
+				},
+				{
+					name: "Preset scripts",
+					desc: "XDF-Base ships built-in scripts (e.g. 一对一建档, 班课档案) and releases them to 00.SYSTEM/xdf_base/ on first launch. Re-release recreates any missing script; existing user edits are preserved.",
+					render: (setting) => this.renderScriptPanel(setting),
+				},
+			],
+		};
+	}
+
+	private appearanceGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Appearance",
+			items: [
+				{
+					name: "Show icon in sidebar",
+					desc: "Add QuickAdd icon to the sidebar ribbon. Requires a reload.",
+					control: { type: "toggle", key: "enableRibbonIcon" },
+				},
+			],
+		};
+	}
+
+	private developerGroup(): SettingDefinitionGroup<SettingsKey> {
+		return {
+			type: "group",
+			heading: "Developer",
+			items: [
+				{
+					name: "Development information",
+					desc: "Git information for developers.",
+					render: (setting) => this.renderDevInfo(setting),
+				},
+			],
+		};
+	}
+
+	// ----- render helpers -----
+
+	/**
+	 * A description ending in a documentation link. Built fresh on every call: the
+	 * declarative renderer clones fragments before inserting them, but
+	 * getSettingDefinitions() runs per render anyway, so a fresh fragment is free
+	 * and cannot be accidentally re-parented.
+	 *
+	 * `linkText` names its destination wherever two links could be on screen at
+	 * once, matching Obsidian's own "Learn more about ..." phrasing.
+	 */
+	private descWithDocsLink(
+		text: string,
+		url: string,
+		linkText = "Learn more",
+	): DocumentFragment {
+		const fragment = document.createDocumentFragment();
+		fragment.append(document.createTextNode(text));
+		createDocsLink(fragment, url, linkText);
+		return fragment;
+	}
+
+	/** Strip the label/description column and let a row span the full width —
+	 * used to host the mounted Svelte views. The declarative API requires a
+	 * `name` on every definition (for search indexing); we set it on the def and
+	 * remove the rendered `infoEl` here so the view still spans full width. */
+	private prepareFullWidthSetting(setting: Setting): void {
+		setting.infoEl.remove();
+		setting.settingEl.addClass("qa-setting-full-width");
+		setting.controlEl.addClass("qa-setting-full-width-control");
+	}
+
+	// The declarative framework builds every group by calling these `render`
+	// closures in turn, so a throw out of one of them abandons the rest: when
+	// ChoiceView's mount threw, QuickAdd's settings came up as a lone "Choices &
+	// packages" heading with nothing under it, and no other section rendered at
+	// all (#1451, #1507, #1566). That guard now lives in mountComponent itself, so
+	// every Svelte host in the plugin gets it (#1584) — here we only choose which
+	// card takes the view's place.
+	//
+	// ChoiceView has its own <svelte:boundary> for reactive failures inside the
+	// list; mountComponent catches the setup that boundary sits inside.
+
+	private renderChoicesView(setting: Setting): () => void {
+		this.prepareFullWidthSetting(setting);
+
+		this.choiceViewHandle?.destroy();
+		const handle = mountComponent(
+			setting.controlEl,
+			ChoiceView,
+			{
+				app: this.app,
+				plugin: this.plugin,
+				choices: settingsStore.getState().choices,
+				// Typed Plain<IChoice[]> (not IChoice[]) so a forgotten $state.snapshot at
+				// the call site is a COMPILE error here — this is the real persistence sink
+				// that must never receive a live Svelte $state proxy. Plain<T> is assignable
+				// to T, so setState still accepts it.
+				saveChoices: (choices: Plain<IChoice[]>) => {
+					settingsStore.setState({ choices });
+				},
+			},
+			// The choice list is the one view whose failure has a recovery story worth
+			// spelling out (the data.json advice in ChoicesUnavailable), and the same
+			// card the view itself shows when the tree is unreadable — so a mount
+			// failure and a render failure look identical to the user.
+			{ what: "your choices", fallbackComponent: ChoicesUnavailable },
+		);
+		this.choiceViewHandle = handle;
+
+		// Capture the handle so a stale cleanup can only ever destroy its own
+		// mount (and only nulls the field while it still points at this mount).
+		return () => {
+			handle.destroy();
+			if (this.choiceViewHandle === handle) {
+				this.choiceViewHandle = null;
+			}
+		};
+	}
+
+	private renderGlobalVariablesView(setting: Setting): () => void {
+		this.prepareFullWidthSetting(setting);
+
+		this.globalVariablesViewHandle?.destroy();
+		const handle = mountComponent(
+			setting.controlEl,
+			GlobalVariablesView,
+			{
+				app: this.app,
+				plugin: this.plugin,
+			},
+			{ what: "your global variables" },
+		);
+		this.globalVariablesViewHandle = handle;
+
+		return () => {
+			handle.destroy();
+			if (this.globalVariablesViewHandle === handle) {
+				this.globalVariablesViewHandle = null;
+			}
+		};
+	}
+
+	/** Packages description, with the reason Export is unavailable when it is. */
+	private packagesDesc(hasNothingToExport: boolean): DocumentFragment {
+		return this.descWithDocsLink(
+			hasNothingToExport
+				? `${PACKAGES_DESC} Export becomes available once you have a choice. `
+				: `${PACKAGES_DESC} `,
+			DOCS_URLS.packages,
+			"Learn more about packages",
+		);
+	}
+
+	private renderPackages(setting: Setting): () => void {
+		// Both package actions are secondary utilities — not the page's primary
+		// action ("New choice" is) — so neither is a CTA. Keeping only one filled
+		// primary button in the view avoids competing purple CTAs (per the
+		// one-primary-button-per-page rule).
+		let exportButton: ButtonComponent | undefined;
+		setting.addButton((button) => {
+			exportButton = button;
+			button.setButtonText("Export package…").onClick(() => {
+				const choicesSnapshot = rootChoicesOf(
+					settingsStore.getState().choices,
+				);
+				new ExportPackageModal(
+					this.app,
+					this.plugin,
+					choicesSnapshot,
+				).open();
+			});
+		});
+
+		// Import stays available with zero choices on purpose: importing a package
+		// is one of the most useful things a brand-new user can do, so the block as
+		// a whole is not de-emphasised, only the action that cannot work.
+		setting.addButton((button) =>
+			button.setButtonText("Import package…").onClick(() => {
+				new ImportPackageModal(this.app).open();
+			}),
+		);
+
+		// "Export package…" used to be the first concrete action a new user saw
+		// below the "No choices yet" empty state, with nothing to export (issue
+		// #1547). The tooltip covers desktop hover; the description carries the
+		// same reason for touch, where there is no hover, and for screen readers.
+		const apply = (hasNothingToExport: boolean): void => {
+			setting.setDesc(this.packagesDesc(hasNothingToExport));
+			if (!exportButton) return;
+			exportButton.setDisabled(hasNothingToExport);
+			if (hasNothingToExport) {
+				exportButton.setTooltip("Nothing to export yet");
+			} else {
+				// setTooltip("") is unspecified; Obsidian's tooltip is driven by
+				// aria-label, so drop the attribute outright.
+				exportButton.buttonEl.removeAttribute("aria-label");
+			}
+		};
+
+		// The declarative tab renders once and does NOT re-render on store changes,
+		// so subscribe to keep the state honest while the tab stays open.
+		let hasNothingToExport =
+			rootChoicesOf(settingsStore.getState().choices).length === 0;
+		apply(hasNothingToExport);
+
+		this.packagesUnsubscribe?.();
+		const unsubscribe = settingsStore.subscribe((settings) => {
+			const next = rootChoicesOf(settings.choices).length === 0;
+			if (next === hasNothingToExport) return;
+			hasNothingToExport = next;
+			apply(next);
+		});
+		this.packagesUnsubscribe = unsubscribe;
+
+		return () => {
+			unsubscribe();
+			if (this.packagesUnsubscribe === unsubscribe) {
+				this.packagesUnsubscribe = null;
+			}
+		};
+	}
+
+	private renderDateAliases(setting: Setting): void {
+		setting.settingEl.addClass("qa-date-alias-setting");
+		setting.controlEl.addClass("qa-date-alias-control");
+
+		let textAreaRef: TextAreaComponent | null = null;
+
+		setting.addTextArea((textArea) => {
+			textAreaRef = textArea;
+			textArea
+				.setPlaceholder("t = today\ntm = tomorrow\nyd = yesterday")
+				.setValue(
+					formatDateAliasLines(settingsStore.getState().dateAliases),
+				)
+				.onChange((value) => {
+					settingsStore.setState({
+						dateAliases: parseDateAliasLines(value),
+					});
+				});
+			textArea.inputEl.addClass("qa-date-alias-input");
+		});
+
+		setting.addButton((button) => {
+			button.setButtonText("Reset to defaults").onClick(() => {
+				settingsStore.setState({ dateAliases: DEFAULT_DATE_ALIASES });
+				textAreaRef?.setValue(formatDateAliasLines(DEFAULT_DATE_ALIASES));
+			});
+			button.buttonEl.addClass("qa-date-alias-reset");
+		});
+	}
+
+	/**
+	 * 数据库面板：
+	 * - 状态查询（表格数 / 路径 / dirty 标志）
+	 * - 初始化（已经初始化了，重置 dirty 标志）
+	 * - 重建（清空表 + 全量重新扫描 vault）
+	 *
+	 * 状态会同步显示在按钮下方的 <pre> 块里。
+	 */
+	private renderDatabasePanel(setting: Setting): () => void {
+		this.prepareFullWidthSetting(setting);
+		setting.settingEl.addClass("qa-xdf-database-setting");
+		setting.controlEl.addClass("qa-xdf-database-control");
+
+		const container = setting.controlEl.createDiv("qa-xdf-database-panel");
+		const statusEl = container.createEl("pre", {
+			cls: "qa-xdf-database-status",
+			text: "Loading…",
+		});
+		const buttonRow = container.createDiv("qa-xdf-database-buttons");
+
+		const renderStatus = (): void => {
+			const xdf = getXdfBaseInstance();
+			if (!xdf) {
+				statusEl.setText("(plugin not fully initialized)");
+				return;
+			}
+			const s = xdf.getDatabaseStatus();
+			const lines = [
+				`Path:        ${s.path}`,
+				`Open:        ${s.isOpen}`,
+				`Dirty:       ${s.isDirty}`,
+				`Tables (${s.tableCount}): ${s.tables.length ? s.tables.join(", ") : "(none)"}`,
+			];
+			statusEl.setText(lines.join("\n"));
+		};
+
+		setting.addButton((button) => {
+			button.setButtonText("Refresh status").onClick(() => renderStatus());
+		});
+
+		buttonRow.createEl("button", {
+			cls: "qa-xdf-db-init",
+			text: "Initialize database",
+		}).addEventListener("click", async () => {
+			const xdf = getXdfBaseInstance();
+			if (!xdf) {
+				new Notice("XDF-Base not initialized yet");
+				return;
+			}
+			try {
+				await xdf.initDatabase();
+				new Notice("Database initialized");
+			} catch (err) {
+				new Notice(`Init failed: ${err}`);
+			}
+			renderStatus();
+		});
+
+		buttonRow.createEl("button", {
+			cls: "qa-xdf-db-rebuild",
+			text: "Rebuild database",
+		}).addEventListener("click", async () => {
+			const xdf = getXdfBaseInstance();
+			if (!xdf) {
+				new Notice("XDF-Base not initialized yet");
+				return;
+			}
+			buttonRow.querySelectorAll("button").forEach((b) => {
+				(b as HTMLButtonElement).disabled = true;
+			});
+			try {
+				new Notice("Rebuilding database…");
+				const report = await xdf.rebuildDatabase();
+				new Notice(
+					`Rebuild done — ${report.fileCount} files (${report.durationMs}ms)`,
+				);
+			} catch (err) {
+				new Notice(`Rebuild failed: ${err}`);
+			} finally {
+				buttonRow.querySelectorAll("button").forEach((b) => {
+					(b as HTMLButtonElement).disabled = false;
+				});
+				renderStatus();
+			}
+		});
+
+		// 首次渲染状态
+		renderStatus();
+
+		return () => {
+			// 无需显式清理，settings 销毁时 containerEl 一起被清掉
+		};
+	}
+
+	/**
+	 * 脚本释放面板：
+	 * - 显示当前已安装 / 缺失的预设脚本
+	 * - 一键重新释放（仅补全缺失，不覆盖）
+	 * - 一键补全 Choice（idempotent）
+	 */
+	private renderScriptPanel(setting: Setting): () => void {
+		this.prepareFullWidthSetting(setting);
+		setting.settingEl.addClass("qa-xdf-scripts-setting");
+		setting.controlEl.addClass("qa-xdf-scripts-control");
+
+		const container = setting.controlEl.createDiv("qa-xdf-scripts-panel");
+		const statusEl = container.createEl("pre", {
+			cls: "qa-xdf-scripts-status",
+			text: "Loading…",
+		});
+		const buttonRow = container.createDiv("qa-xdf-scripts-buttons");
+
+		const renderStatus = async (): Promise<void> => {
+			const releaser = new ScriptReleaser(this.app);
+			try {
+				const status = await releaser.getStatus();
+				const lines: string[] = [
+					`System dir:  ${status.systemDir}`,
+					`Installed (${status.installed.length}):`,
+					...status.installed.map((p) => `  ✓ ${p}`),
+				];
+				if (status.missing.length > 0) {
+					lines.push(
+						`Missing (${status.missing.length}):`,
+						...status.missing.map((p) => `  ✗ ${p}`),
+					);
+				} else {
+					lines.push("Missing: (none)");
+				}
+				statusEl.setText(lines.join("\n"));
+			} catch (err) {
+				statusEl.setText(`Error: ${err}`);
+			}
+		};
+
+		buttonRow.createEl("button", {
+			cls: "qa-xdf-scripts-release",
+			text: "Re-release scripts",
+		}).addEventListener("click", async () => {
+			buttonRow.querySelectorAll("button").forEach((b) => {
+				(b as HTMLButtonElement).disabled = true;
+			});
+			try {
+				const xdf = getXdfBaseInstance();
+				if (!xdf) {
+					new Notice("XDF-Base not initialized yet");
+					return;
+				}
+				const report = await xdf.releaseScripts();
+				new Notice(
+					`Release: created ${report.created.length}, updated ${report.updated.length}, failed ${report.failed.length}`,
+				);
+			} catch (err) {
+				new Notice(`Release failed: ${err}`);
+			} finally {
+				buttonRow.querySelectorAll("button").forEach((b) => {
+					(b as HTMLButtonElement).disabled = false;
+				});
+				await renderStatus();
+			}
+		});
+
+		buttonRow.createEl("button", {
+			cls: "qa-xdf-scripts-choices",
+			text: "Ensure Choices",
+		}).addEventListener("click", async () => {
+			buttonRow.querySelectorAll("button").forEach((b) => {
+				(b as HTMLButtonElement).disabled = true;
+			});
+			try {
+				const xdf = getXdfBaseInstance();
+				if (!xdf) {
+					new Notice("XDF-Base not initialized yet");
+					return;
+				}
+				const result = await xdf.ensureChoices();
+				if (result.updated) {
+					new Notice(`Added ${result.added.length} missing choice(s)`);
+				} else {
+					new Notice("All preset choices are present");
+				}
+			} catch (err) {
+				new Notice(`Ensure failed: ${err}`);
+			} finally {
+				buttonRow.querySelectorAll("button").forEach((b) => {
+					(b as HTMLButtonElement).disabled = false;
+				});
+			}
+		});
+
+		void renderStatus();
+
+		return () => {
+			// no-op
+		};
+	}
+
+	private renderTemplateFolderPaths(setting: Setting): () => void {
+		// Let this row span the full pane (label/desc stacked above a full-width
+		// list) instead of cramming a growing list into the narrow control column.
+		setting.settingEl.addClass("qa-template-folders-setting");
+
+		const container = setting.controlEl.createDiv("qa-template-folders");
+		const listEl = container.createDiv("qa-template-folder-list");
+
+		const getPaths = (): string[] =>
+			normalizeTemplateFolderPaths(settingsStore.getState().templateFolderPaths);
+		const setPaths = (paths: string[]): void => {
+			settingsStore.setState({ templateFolderPaths: paths });
+		};
+
+		const renderList = (): void => {
+			listEl.empty();
+			const paths = getPaths();
+			if (paths.length === 0) {
+				listEl.createDiv({
+					cls: "qa-template-folder-empty",
+					text: "No folders added yet.",
+				});
+				return;
+			}
+			for (const folder of paths) {
+				const row = listEl.createDiv("qa-template-folder-row");
+				// title gives desktop a hover tooltip for paths truncated by ellipsis;
+				// on mobile (no hover) the path wraps instead — see styles.css.
+				row.createSpan({
+					cls: "qa-template-folder-name",
+					text: folder,
+					attr: { title: folder },
+				});
+				new ExtraButtonComponent(row)
+					.setIcon("trash-2")
+					.setTooltip(`Remove ${folder}`)
+					.onClick(() => {
+						setPaths(getPaths().filter((f) => f !== folder));
+						renderList();
+					});
+			}
+		};
+
+		const inputRow = container.createDiv("qa-template-folder-input-row");
+		const input = new TextComponent(inputRow);
+		input.setPlaceholder("templates/");
+		input.inputEl.addClass("qa-template-folder-input");
+		const suggester = new GenericTextSuggester(
+			this.app,
+			input.inputEl,
+			sortFolderPathsByTree(getAllFolderPathsInVault(this.app)).filter(
+				(path) => path !== "/",
+			),
+		);
+
+		const addFolder = (): void => {
+			// Store the canonical (normalized) form so "templates" and "templates/"
+			// can't both be added, and dedupe against the existing list.
+			const [folder] = normalizeTemplateFolderPaths([input.inputEl.value]);
+			input.inputEl.value = "";
+			if (!folder) return;
+			const paths = getPaths();
+			if (paths.includes(folder)) return;
+			setPaths([...paths, folder]);
+			renderList();
+		};
+
+		const onKeydown = (e: KeyboardEvent): void => {
+			if (e.key === "Enter") {
+				e.preventDefault();
+				addFolder();
+			}
+		};
+		input.inputEl.addEventListener("keydown", onKeydown);
+		new ButtonComponent(inputRow)
+			.setCta()
+			.setButtonText("Add")
+			.onClick(() => addFolder());
+
+		renderList();
+
+		// The suggester registers global (document/window) listeners while open;
+		// tear it down when the row is rebuilt or the tab hides so nothing leaks.
+		return () => {
+			input.inputEl.removeEventListener("keydown", onKeydown);
+			suggester.destroy();
+		};
+	}
+
+	private renderDevInfo(setting: Setting): void {
+		const infoContainer = setting.settingEl.createDiv();
+		infoContainer.addClass("qa-dev-info");
+
+		renderDevelopmentInfo(infoContainer, {
+			branch: __DEV_GIT_BRANCH__,
+			commit: __DEV_GIT_COMMIT__,
+			dirty: __DEV_GIT_DIRTY__,
+		});
+	}
+}

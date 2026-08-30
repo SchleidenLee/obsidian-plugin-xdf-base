@@ -1,0 +1,582 @@
+ 
+ 
+import { TextInputSuggest } from "./suggest";
+import type { App } from "obsidian";
+import { TFile } from "obsidian";
+import { FILE_LINK_REGEX } from "../../constants";
+import { FileIndex, type SearchResult, type SearchContext, type IndexedFile } from "./FileIndex";
+import { normalizeForSearch } from "./utils";
+import { getQuickAddInstance } from "../../quickAddInstance";
+import { createOwnedElement, getOwnerDocument } from "../../utils/activeWindow";
+
+function createSuggestionPill(
+	owner: Node,
+	matchType: SearchResult["matchType"],
+): HTMLElement | null {
+	const pill = createOwnedElement(owner, "span");
+	pill.classList.add("qa-suggestion-pill");
+
+	switch (matchType) {
+		case "alias":
+			pill.classList.add("qa-alias-pill");
+			pill.textContent = "alias";
+			return pill;
+		case "heading":
+			pill.classList.add("qa-heading-pill");
+			pill.textContent = "H";
+			return pill;
+		case "block":
+			pill.classList.add("qa-block-pill");
+			pill.textContent = "^";
+			return pill;
+		case "unresolved":
+			pill.classList.add("qa-unresolved-pill");
+			pill.textContent = "unresolved";
+			return pill;
+		default:
+			return null;
+	}
+}
+
+export class FileSuggester extends TextInputSuggest<SearchResult> {
+	private lastInput = "";
+	private fileIndex: FileIndex;
+	private sourcePathOverride?: string;
+	private tooltipTimeout: number | undefined;
+	private scrollListener: (() => void) | undefined;
+	private scrollListenerDocument: Document | undefined;
+
+	constructor(
+		public app: App,
+		public inputEl: HTMLInputElement | HTMLTextAreaElement,
+		options?: { sourcePath?: string }
+	) {
+		super(app, inputEl);
+
+		this.sourcePathOverride = options?.sourcePath;
+		this.fileIndex = FileIndex.getInstance(app, getQuickAddInstance());
+
+		// Initialize index in background
+		void this.fileIndex.ensureIndexed();
+	}
+
+	private normalizeFolderPath(p?: string | null): string {
+		if (!p || p === "/") return "";
+		return p.replace(/\/+$/, "");
+	}
+
+	private getSourcePath(): string {
+		return this.sourcePathOverride ?? this.app.workspace.getActiveFile()?.path ?? "";
+	}
+
+	private getSourceFolder(): string {
+		const sourcePath = this.getSourcePath();
+		if (!sourcePath) return "";
+
+		// Use Obsidian's API to get the parent folder, works for both existing and non-existing paths
+		const parent = this.app.fileManager.getNewFileParent(sourcePath);
+		return this.normalizeFolderPath(parent?.path);
+	}
+
+	private resolveRelative(baseFolder: string, input: string): { folder: string; query: string } {
+		let folder = this.normalizeFolderPath(baseFolder);
+		let query = input;
+
+		// Handle ./ prefix
+		if (query.startsWith("./")) {
+			query = query.slice(2);
+		}
+
+		// Handle multiple ../ prefixes
+		while (query.startsWith("../")) {
+			const parts = folder.split("/");
+			// If we're at root (empty folder), we can't go up - stop processing
+			if (!folder || parts.length === 0 || (parts.length === 1 && parts[0] === "")) {
+				break;
+			}
+			parts.pop();
+			folder = parts.join("/");
+			query = query.slice(3);
+		}
+
+		return { folder: this.normalizeFolderPath(folder), query };
+	}
+
+
+
+	getSuggestions(inputStr: string): SearchResult[] {
+		if (this.inputEl.selectionStart === null) return [];
+
+		const cursorPosition: number = this.inputEl.selectionStart;
+		const inputBeforeCursor: string = inputStr.slice(0, cursorPosition);
+		const fileLinkMatch = FILE_LINK_REGEX.exec(inputBeforeCursor);
+
+		if (!fileLinkMatch) {
+			return [];
+		}
+
+		const fileNameInput: string = fileLinkMatch[1];
+		this.lastInput = fileNameInput;
+
+		// Detect block reference pattern ("#^") *before* heading detection to avoid conflicts
+		if (fileNameInput.includes('#^')) {
+			return this.getBlockSuggestions(fileNameInput);
+		}
+
+		// Heading suggestions ("#heading")
+		const hashIndex = fileNameInput.indexOf('#');
+		if (hashIndex > 0) {
+			return this.getHeadingSuggestions(fileNameInput);
+		}
+
+		// Handle relative path shortcuts
+		if (fileNameInput.startsWith('./') || fileNameInput.startsWith('../')) {
+			return this.getRelativePathSuggestions(fileNameInput);
+		}
+
+		// Handle embeds/attachments - check if input starts with !
+		const isEmbed = inputBeforeCursor.includes('![[');
+		if (isEmbed) {
+			return this.getAttachmentSuggestions(fileNameInput);
+		}
+
+		// Build search context - use source folder even if file doesn't exist yet
+		// Clear currentFile bias when using override to avoid heading/block bias from unrelated active file
+		const sourceFolder = this.getSourceFolder();
+		const activeFile = this.app.workspace.getActiveFile();
+		const context: SearchContext = {
+		currentFile: this.sourcePathOverride ? undefined : (activeFile ?? undefined),
+		 currentFolder: sourceFolder
+	};
+
+	return this.fileIndex.search(fileNameInput, context, 50);
+	}
+
+	private getHeadingSuggestions(input: string): SearchResult[] {
+		const [fileName, headingQuery] = input.split('#');
+		const noFileSpecified = fileName.trim() === '';
+		const headingQueryNormalized = normalizeForSearch(headingQuery ?? "");
+
+		// Determine candidate files based on whether file part was specified
+		let candidateFiles: IndexedFile[] = [];
+
+		if (noFileSpecified) {
+			const activeFile = this.app.workspace.getActiveFile();
+			if (activeFile) {
+				const indexedFile = this.fileIndex.getFile(activeFile.path);
+				if (indexedFile) {
+					candidateFiles = [indexedFile];
+				}
+			}
+		} else {
+			candidateFiles = this.fileIndex.search(fileName, {}, 1).map(r => r.file);
+		}
+
+		if (candidateFiles.length === 0) return [];
+
+		const results: SearchResult[] = [];
+
+		for (const file of candidateFiles) {
+			const headings = this.fileIndex.getHeadings(file);
+
+			const filteredHeadings = headings
+				.filter(h => headingQuery === '' || normalizeForSearch(h).includes(headingQueryNormalized))
+				.slice(0, 20);
+
+			for (const heading of filteredHeadings) {
+				results.push({
+					file,
+					score: 0,
+					matchType: 'heading' as const,
+					displayText: noFileSpecified ? `#${heading}` : `${file.basename}#${heading}`
+				});
+			}
+		}
+
+		return results;
+	}
+
+
+
+	private getBlockSuggestions(input: string): SearchResult[] {
+		// Split on the full "#^" sequence to correctly separate file name and block query
+		const [fileName, blockQuery] = input.split('#^');
+		const blockQueryNormalized = normalizeForSearch(blockQuery ?? "");
+		const fileResults = this.fileIndex.search(fileName, {}, 1);
+
+		if (fileResults.length === 0) return [];
+
+		const file = fileResults[0].file;
+		const blockIds = this.fileIndex.getBlockIds(file);
+
+		return blockIds
+			.filter(b => blockQuery === '' || normalizeForSearch(b).includes(blockQueryNormalized))
+			.slice(0, 20)
+			.map(blockId => ({
+				file,
+				score: 0,
+				matchType: 'block' as const,
+				displayText: `${file.basename}#^${blockId}`
+			}));
+	}
+
+	private getRelativePathSuggestions(input: string): SearchResult[] {
+		const baseFolder = this.getSourceFolder();
+		const { folder, query } = this.resolveRelative(baseFolder, input);
+
+		// If there's a query after the relative path, search with it
+		if (query) {
+			return this.fileIndex.search(query, {
+				currentFolder: folder
+			}, 20);
+		}
+
+		// Otherwise show all files in the target folder
+		const allResults = this.fileIndex.search('', {
+			currentFolder: folder
+		}, 50);
+
+		// Filter to ensure exact folder match using normalized paths
+		const normalize = (p?: string) => this.normalizeFolderPath(p || "");
+		return allResults.filter(r => normalize(r.file.folder) === normalize(folder));
+	}
+
+	private getAttachmentSuggestions(query: string): SearchResult[] {
+		// Get all files, not just markdown
+		const allFiles = this.app.vault.getFiles();
+		const attachmentExtensions = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'pdf', 'mp4', 'webm', 'mov', 'canvas'];
+		const queryLower = normalizeForSearch(query);
+
+		const attachmentFiles = allFiles.filter(file =>
+			attachmentExtensions.includes(file.extension.toLowerCase()) &&
+			(query === '' || normalizeForSearch(file.basename).includes(queryLower))
+		);
+
+		return attachmentFiles
+			.slice(0, 20)
+			.map(file => ({
+				file: {
+					path: file.path,
+					pathNormalized: normalizeForSearch(file.path),
+					basename: file.basename,
+					basenameNormalized: normalizeForSearch(file.basename),
+					aliases: [],
+					aliasesNormalized: [],
+					headings: [],
+					blockIds: [],
+					tags: [],
+					modified: file.stat.mtime,
+					folder: this.normalizeFolderPath(file.parent?.path || "")
+				},
+				score: 0,
+				matchType: 'exact' as const,
+				displayText: file.name
+			}));
+	}
+
+	renderSuggestion(item: SearchResult, el: HTMLElement): void {
+		const { file, matchType, displayText } = item;
+
+		// Add CSS classes for theming
+		el.classList.add("qaFileSuggestionItem");
+		el.classList.add(`qa-suggest-${matchType}`);
+
+		let mainText = displayText;
+		let subText = "";
+		let shouldHighlightMainText = false;
+		let highlightQuery = "";
+
+		switch (matchType) {
+			case 'exact':
+				mainText = file.basename;
+				subText = file.path;
+				break;
+			case 'alias':
+				mainText = displayText;
+				subText = file.path;
+				break;
+			case 'fuzzy':
+				mainText = file.basename;
+				subText = file.path;
+				break;
+			case 'heading': {
+				const [fileName, heading] = displayText.split('#');
+				// Highlight the query in the heading text if possible
+				const headingQuery = this.lastInput.includes('#')
+					? this.lastInput.split('#')[1]
+					: '';
+				const headingQueryNormalized = normalizeForSearch(headingQuery ?? "");
+				if (headingQuery && normalizeForSearch(heading).includes(headingQueryNormalized)) {
+					mainText = heading;
+					shouldHighlightMainText = true;
+					highlightQuery = headingQuery;
+				} else {
+					mainText = heading;
+				}
+				subText = fileName; // Show source file name
+				break;
+			}
+			case 'block': {
+				// Split on "#^" to avoid the trailing hash in the file name
+				const [fileName, blockId] = displayText.split('#^');
+				mainText = blockId; // Show only the block ID
+				subText = fileName; // Show source file name without '#'
+				break;
+			}
+			case 'unresolved':
+				mainText = displayText;
+				subText = "Unresolved link";
+				break;
+		}
+
+		const content = createOwnedElement(el, "div");
+		content.className = "qa-suggestion-content";
+
+		const mainTextEl = createOwnedElement(el, "span");
+		mainTextEl.className = "suggestion-main-text";
+		if (shouldHighlightMainText) {
+			this.renderMatch(mainTextEl, mainText, highlightQuery);
+		} else {
+			mainTextEl.textContent = mainText;
+		}
+		content.appendChild(mainTextEl);
+
+		const pill = createSuggestionPill(el, matchType);
+		if (pill) content.appendChild(pill);
+
+		const subTextEl = createOwnedElement(el, "span");
+		subTextEl.className = "suggestion-sub-text";
+		subTextEl.textContent = subText;
+
+		el.replaceChildren(content, subTextEl);
+
+		// Add hover tooltip for content preview
+		this.addHoverTooltip(el, file);
+	}
+
+	open(container: HTMLElement, inputEl: HTMLElement): void {
+		super.open(container, inputEl);
+		if (!this.scrollListener) {
+			const activeDocument = getOwnerDocument(this.inputEl);
+			const listener = () => this.hideTooltip();
+			activeDocument.addEventListener('scroll', listener, { passive: true });
+			this.scrollListener = listener;
+			this.scrollListenerDocument = activeDocument;
+		}
+	}
+
+	private hideTooltip(): void {
+		const activeDocument = getOwnerDocument(this.inputEl);
+
+		if (this.tooltipTimeout !== undefined) {
+			window.clearTimeout(this.tooltipTimeout);
+			this.tooltipTimeout = undefined;
+		}
+		activeDocument.querySelector('.qa-file-tooltip')?.remove();
+	}
+
+	private addHoverTooltip(el: HTMLElement, file: { path: string; }): void {
+		const activeDocument = getOwnerDocument(el);
+
+		el.addEventListener('mouseenter', () => {
+			this.hideTooltip();
+			this.tooltipTimeout = window.setTimeout(() => {
+				const tooltip = this.createTooltip(file);
+				if (tooltip) {
+					activeDocument.body.appendChild(tooltip);
+					this.positionTooltip(tooltip, el);
+				}
+			}, 200);
+		});
+
+		el.addEventListener('mouseleave', () => this.hideTooltip());
+		el.addEventListener('blur', () => this.hideTooltip());
+	}
+
+	private createTooltip(file: { path: string; }): HTMLElement | null {
+		const obsidianFile = this.app.vault.getAbstractFileByPath(file.path);
+		if (!obsidianFile || !(obsidianFile instanceof TFile)) return null;
+		const owner = this.inputEl;
+
+		const tooltip = createOwnedElement(owner, 'div');
+		tooltip.className = 'qa-file-tooltip';
+
+		// For now, just show basic info - content preview can be added later
+		const header = createOwnedElement(owner, "div");
+		header.className = "qa-tooltip-header";
+		header.textContent = obsidianFile.basename;
+
+		const content = createOwnedElement(owner, "div");
+		content.className = "qa-tooltip-content";
+
+		const path = createOwnedElement(owner, "div");
+		path.textContent = `Path: ${obsidianFile.path}`;
+
+		const modified = createOwnedElement(owner, "div");
+		modified.textContent = `Modified: ${new Date(obsidianFile.stat.mtime).toLocaleDateString()}`;
+
+		content.append(path, modified);
+		tooltip.append(header, content);
+
+		return tooltip;
+	}
+
+	private positionTooltip(tooltip: HTMLElement, trigger: HTMLElement): void {
+		const rect = trigger.getBoundingClientRect();
+		// position:fixed and z-index live in the `.qa-file-tooltip` rule; only the
+		// computed coordinates are dynamic (template literals, so not flagged by
+		// no-static-styles-assignment).
+		tooltip.style.left = `${rect.right + 10}px`;
+		tooltip.style.top = `${rect.top}px`;
+	}
+
+	close(): void {
+		this.hideTooltip();
+		if (this.scrollListener && this.scrollListenerDocument) {
+			this.scrollListenerDocument.removeEventListener('scroll', this.scrollListener);
+			this.scrollListener = undefined;
+			this.scrollListenerDocument = undefined;
+		}
+
+		super.close();
+	}
+
+	selectSuggestion(item: SearchResult): void {
+		if (this.inputEl.selectionStart === null) return;
+
+		const cursorPosition: number = this.inputEl.selectionStart;
+		const lastInputLength: number = this.lastInput.length;
+		const currentInputValue: string = this.inputEl.value;
+		let insertedEndPosition = 0;
+
+		// Detect if we're in embed mode (![[) by looking at the 3 chars before the lastInputStart
+		const isEmbedMode = this.inputEl.value.slice(cursorPosition - this.lastInput.length - 3, cursorPosition - this.lastInput.length) === '![[';
+
+		if (item.matchType === 'unresolved') {
+			insertedEndPosition = this.makeLinkManually(
+				currentInputValue,
+				item.displayText.replace(/.md$/, ""),
+				cursorPosition,
+				lastInputLength
+			);
+		} else if (item.matchType === 'heading' || item.matchType === 'block') {
+			// Heading/block selection - use manual link with full path
+			const linkTarget = item.displayText;
+			insertedEndPosition = this.makeLinkManually(
+				currentInputValue,
+				linkTarget,
+				cursorPosition,
+				lastInputLength
+			);
+		} else if (isEmbedMode) {
+			// For embeds we always make the link manually to avoid duplicating '!'
+			insertedEndPosition = this.makeLinkManually(
+				currentInputValue,
+				item.displayText,
+				cursorPosition,
+				lastInputLength
+			);
+		} else {
+			// Existing file
+			const obsidianFile = this.app.vault.getAbstractFileByPath(item.file.path);
+			if (obsidianFile instanceof TFile) {
+				const alias = item.matchType === 'alias' ? item.displayText : undefined;
+				insertedEndPosition = this.makeLinkObsidianMethod(
+					obsidianFile,
+					currentInputValue,
+					cursorPosition,
+					lastInputLength,
+					alias
+				);
+			} else {
+				insertedEndPosition = this.makeLinkManually(
+					currentInputValue,
+					item.displayText,
+					cursorPosition,
+					lastInputLength
+				);
+			}
+		}
+
+		this.inputEl.trigger("input");
+		this.close();
+		this.inputEl.setSelectionRange(
+			insertedEndPosition,
+			insertedEndPosition
+		);
+	}
+
+	private makeLinkObsidianMethod(
+		linkFile: TFile,
+		currentInputValue: string,
+		cursorPosition: number,
+		lastInputLength: number,
+		alias?: string
+	): number {
+		// Need to get file again, otherwise it won't be recognized by the link generator. (hotfix, but not a good solution)
+		const file = this.app.vault.getAbstractFileByPath(
+			linkFile.path
+		);
+		if (!(file instanceof TFile)) {
+			return this.makeLinkManually(
+				currentInputValue,
+				linkFile.path,
+				cursorPosition,
+				lastInputLength
+			);
+		}
+		const link = this.app.fileManager.generateMarkdownLink(
+			file,
+			this.getSourcePath(),
+			"",
+			alias ?? ""
+		);
+		this.inputEl.value = this.getNewInputValueForFileLink(
+			currentInputValue,
+			link,
+			cursorPosition,
+			lastInputLength
+		);
+		return cursorPosition - lastInputLength + link.length + 2;
+	}
+
+	private makeLinkManually(
+		currentInputValue: string,
+		item: string,
+		cursorPosition: number,
+		lastInputLength: number
+	) {
+		this.inputEl.value = this.getNewInputValueForFileName(
+			currentInputValue,
+			item,
+			cursorPosition,
+			lastInputLength
+		);
+		return cursorPosition - lastInputLength + item.length + 2;
+	}
+
+	private getNewInputValueForFileLink(
+		currentInputElValue: string,
+		selectedItem: string,
+		cursorPosition: number,
+		lastInputLength: number
+	): string {
+		return `${currentInputElValue.slice(
+			0,
+			cursorPosition - lastInputLength - 2
+		)}${selectedItem}${currentInputElValue.slice(cursorPosition)}`;
+	}
+
+	private getNewInputValueForFileName(
+		currentInputElValue: string,
+		selectedItem: string,
+		cursorPosition: number,
+		lastInputLength: number
+	): string {
+		return `${currentInputElValue.slice(
+			0,
+			cursorPosition - lastInputLength
+		)}${selectedItem}]]${currentInputElValue.slice(cursorPosition)}`;
+	}
+
+}

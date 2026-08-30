@@ -1,0 +1,114 @@
+import type { TFile, CachedMetadata } from "obsidian";
+import type { FieldFilter } from "./FieldSuggestionParser";
+import {
+	normalizeFrontmatterTagValues,
+	normalizeTag,
+} from "./tagNormalizer";
+
+export class FieldSuggestionFileFilter {
+	/**
+	 * Filters files based on the provided filter criteria
+	 */
+	static filterFiles(
+		files: TFile[],
+		filters: FieldFilter,
+		metadataCache: (file: TFile) => CachedMetadata | null,
+	): TFile[] {
+		if (Object.keys(filters).length === 0) {
+			return files; // No filters, return all files
+		}
+
+		return files.filter((file) => {
+			const folders = this.getIncludeFolders(filters);
+			if (
+				folders.length > 0 &&
+				!folders.some((folder) => this.matchesFolder(file, folder))
+			) {
+				return false;
+			}
+
+			// Check tag filters
+			if (
+				filters.tags &&
+				filters.tags.length > 0 &&
+				!this.matchesTags(file, filters.tags, metadataCache)
+			) {
+				return false;
+			}
+
+			return true;
+		});
+	}
+
+	private static getIncludeFolders(filters: FieldFilter): string[] {
+		const folders = filters.folders?.length
+			? filters.folders
+			: filters.folder
+				? [filters.folder]
+				: [];
+		return [...new Set(folders.map((folder) => this.normalizePath(folder)).filter(Boolean))];
+	}
+
+	private static matchesFolder(file: TFile, folderPath: string): boolean {
+		// Normalize paths for comparison
+		const normalizedFolder = this.normalizePath(folderPath);
+		const normalizedFilePath = this.normalizePath(file.path);
+
+		// Check if file is in the specified folder or its subfolders
+		return (
+			normalizedFilePath.startsWith(normalizedFolder + "/") ||
+			normalizedFilePath.substring(
+				0,
+				normalizedFilePath.lastIndexOf("/"),
+			) === normalizedFolder
+		);
+	}
+
+	private static matchesTags(
+		file: TFile,
+		requiredTags: string[],
+		metadataCache: (file: TFile) => CachedMetadata | null,
+	): boolean {
+		const metadata = metadataCache(file);
+		if (!metadata) {
+			return false;
+		}
+
+		// Get all tags from the file (both frontmatter and inline)
+		const fileTags = this.getAllTags(metadata);
+
+		// Normalize required tags (remove leading # and trim)
+		const normalizedRequiredTags = requiredTags.map(normalizeTag).filter(Boolean);
+
+		// Check if file has all required tags (AND logic)
+		return normalizedRequiredTags.every((requiredTag) =>
+			fileTags.some((fileTag) =>
+				fileTag === requiredTag || fileTag.startsWith(requiredTag + "/"),
+			),
+		);
+	}
+
+	private static getAllTags(metadata: CachedMetadata): string[] {
+		const tags: string[] = [];
+
+		if (metadata.frontmatter?.tags) {
+			tags.push(...normalizeFrontmatterTagValues(metadata.frontmatter.tags));
+		}
+
+		if (metadata.frontmatter?.tag) {
+			tags.push(...normalizeFrontmatterTagValues(metadata.frontmatter.tag));
+		}
+
+		// Get inline tags
+		if (metadata.tags) {
+			tags.push(...metadata.tags.map(tag => normalizeTag(tag.tag)));
+		}
+
+		return tags.filter(Boolean);
+	}
+
+	private static normalizePath(path: string): string {
+		// Remove leading/trailing slashes and normalize
+		return path.replace(/^\/+|\/+$/g, "");
+	}
+}

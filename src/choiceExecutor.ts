@@ -1,0 +1,391 @@
+import { Notice, type App, type WorkspaceLeaf } from "obsidian";
+import type QuickAdd from "./main";
+import type IChoice from "./types/choices/IChoice";
+import type ITemplateChoice from "./types/choices/ITemplateChoice";
+import type ICaptureChoice from "./types/choices/ICaptureChoice";
+import type IMacroChoice from "./types/choices/IMacroChoice";
+import { TemplateChoiceEngine } from "./engine/TemplateChoiceEngine";
+import { CaptureChoiceEngine } from "./engine/CaptureChoiceEngine";
+import { MacroChoiceEngine } from "./engine/MacroChoiceEngine";
+import type { IChoiceExecutor } from "./IChoiceExecutor";
+import type { PromptProvider } from "./interactive/promptProvider";
+import type IMultiChoice from "./types/choices/IMultiChoice";
+import ChoiceSuggester, {
+	emptyFolderNoticeText,
+} from "./gui/suggesters/choiceSuggester";
+import { settingsStore } from "./settingsStore";
+import { runOnePagePreflight } from "./preflight/runOnePagePreflight";
+import { MacroAbortError } from "./errors/MacroAbortError";
+import { ChoiceAbortError } from "./errors/ChoiceAbortError";
+import { UserCancelError } from "./errors/UserCancelError";
+import { isCancellationError, reportError } from "./utils/errorUtils";
+import { getOpenFileOriginLeaf } from "./utilityObsidian";
+import { InputPromptDraftStore } from "./utils/InputPromptDraftStore";
+import type { ChoiceOutcome } from "./types/ChoiceOutcome";
+import {
+	getFocusedPropertyTarget,
+	type FrontmatterPropertyTarget,
+} from "./utils/frontmatterPropertyLinks";
+import type { QuickAddTriggerContext } from "./types/QuickAddTriggerContext";
+import { childChoicesOf } from "./utils/choiceUtils";
+
+export class ChoiceExecutor implements IChoiceExecutor {
+	public variables: Map<string, unknown> = new Map<string, unknown>();
+	// Default to interactive so every GUI entry point (command palette, ribbon,
+	// suggester) keeps its current prompt behaviour. Non-interactive callers (CLI
+	// without `ui`) flip this to false so engine prompts abort instead of hanging.
+	public interactive = true;
+	// When set, script prompts route to this remote provider (interactive session
+	// driven by an external front end) instead of Obsidian modals. See
+	// IChoiceExecutor.promptProvider.
+	public promptProvider?: PromptProvider;
+	// User-script modules loaded by requirement collection (preflight / CLI),
+	// consumed once by MacroChoiceEngine so a script's top-level code runs a
+	// single time per trigger instead of once for introspection plus once for
+	// execution (see IChoiceExecutor.preloadedUserScripts).
+	public readonly preloadedUserScripts = new Map<string, unknown>();
+	public focusedProperty: FrontmatterPropertyTarget | null = null;
+	public triggerContext: QuickAddTriggerContext | null = null;
+	private pendingAbort: MacroAbortError | null = null;
+	private pendingResult: ChoiceOutcome | null = null;
+	private executionDepth = 0;
+	private focusedPropertyOverride: FrontmatterPropertyTarget | null | undefined;
+	private triggerContextOverride: QuickAddTriggerContext | null | undefined;
+
+	constructor(private app: App, private plugin: QuickAdd) {}
+
+	signalAbort(error: MacroAbortError) {
+		this.pendingAbort = error;
+	}
+
+	consumeAbortSignal(): MacroAbortError | null {
+		const abort = this.pendingAbort;
+		this.pendingAbort = null;
+		return abort ?? null;
+	}
+
+	recordExecutionResult(result: ChoiceOutcome) {
+		this.pendingResult = result;
+	}
+
+	private beginExecutionContext(): void {
+		if (this.executionDepth === 0) {
+			this.focusedProperty =
+				this.focusedPropertyOverride !== undefined
+					? this.focusedPropertyOverride
+					: getFocusedPropertyTarget(this.app);
+			// Snapshot the trigger-time editor context at the outermost boundary, so a
+			// nested execute() (a {{MACRO}} that opens a file then runs a FIELD
+			// template, or the API path) keeps the ORIGINAL trigger note as the source
+			// for {{...|default-from:active}}, mirroring focusedProperty's depth-0
+			// semantics. The captured context is still threaded through the suggester
+			// and re-injected via executeWithFocusedProperty for the chosen leaf: on
+			// the LAUNCHER path (Run QuickAdd drill-down) the leaf is its own depth-0
+			// run and the override is what carries the context; on the executor Multi
+			// path the outer execute() now stays pending while the picker is open
+			// (#1630), so the leaf runs nested and simply inherits these still-live
+			// fields — the override it is handed holds the same values. A direct
+			// execute() (command palette/ribbon) has no override and reads live, which
+			// is the trigger note (the active markdown leaf is unchanged by the
+			// launching modal).
+			this.triggerContext =
+				this.triggerContextOverride !== undefined
+					? this.triggerContextOverride
+					: { activeFile: this.app.workspace.getActiveFile() };
+		}
+		this.executionDepth++;
+	}
+
+	private endExecutionContext(): void {
+		this.executionDepth = Math.max(0, this.executionDepth - 1);
+		if (this.executionDepth === 0) {
+			this.focusedProperty = null;
+			this.triggerContext = null;
+			// Preloaded script modules are scoped to ONE outermost execution: a
+			// cancelled/aborted run must not strand its entries, or a later
+			// trigger on a long-lived executor (api.executeChoice callers reuse
+			// one) would consume a module loaded before the user's latest edits.
+			// Cleared at the END so the CLI's collect-then-execute handoff (which
+			// populates the map before execute() begins) still works.
+			this.preloadedUserScripts.clear();
+		}
+	}
+
+	async execute(choice: IChoice): Promise<void> {
+		this.pendingAbort = null;
+		// Keep a nested execute() (e.g. a {{MACRO}} in a Template/Capture body that runs
+		// another choice through this same executor) transparent to the outcome slot of an
+		// enclosing executeWithOutcome(): snapshot and restore pendingResult so the nested
+		// choice's recorded result never leaks into the outer choice's reported outcome.
+		const savedResult = this.pendingResult;
+		this.beginExecutionContext();
+		const originLeaf = getOpenFileOriginLeaf(this.app);
+		const promptDraftStore = InputPromptDraftStore.getInstance();
+		promptDraftStore.beginExecutionScope();
+		try {
+			await this.runOnePagePreflightIfEnabled(choice);
+
+			switch (choice.type) {
+				case "Template": {
+					const templateChoice: ITemplateChoice =
+						choice as ITemplateChoice;
+					await this.onChooseTemplateType(templateChoice, originLeaf);
+					break;
+				}
+				case "Capture": {
+					const captureChoice: ICaptureChoice = choice as ICaptureChoice;
+					await this.onChooseCaptureType(captureChoice, originLeaf);
+					break;
+				}
+				case "Macro": {
+					const macroChoice: IMacroChoice = choice as IMacroChoice;
+					await this.onChooseMacroType(macroChoice, originLeaf);
+					break;
+				}
+				case "Multi": {
+					const multiChoice: IMultiChoice = choice as IMultiChoice;
+					await this.onChooseMultiType(multiChoice);
+					break;
+				}
+				default:
+					break;
+			}
+
+			if (this.pendingAbort) {
+				promptDraftStore.rollbackExecutionScope();
+				return;
+			}
+
+			promptDraftStore.commitExecutionScope();
+		} catch (error) {
+			promptDraftStore.rollbackExecutionScope();
+			throw error;
+		} finally {
+			this.pendingResult = savedResult;
+			this.endExecutionContext();
+		}
+	}
+
+	async executeWithFocusedProperty(
+		choice: IChoice,
+		focusedProperty: FrontmatterPropertyTarget | null,
+		triggerContext?: QuickAddTriggerContext | null,
+	): Promise<void> {
+		const previousFocusedOverride = this.focusedPropertyOverride;
+		const previousTriggerOverride = this.triggerContextOverride;
+		this.focusedPropertyOverride = focusedProperty;
+		// `triggerContext` is `undefined` only when the caller didn't capture one;
+		// leave the override unset so the executor reads it live. A captured value
+		// (including `null` for "no active note at trigger time") IS injected.
+		this.triggerContextOverride = triggerContext;
+		try {
+			await this.execute(choice);
+		} finally {
+			this.focusedPropertyOverride = previousFocusedOverride;
+			this.triggerContextOverride = previousTriggerOverride;
+		}
+	}
+
+	/**
+	 * Executes a Template or Capture choice and returns a structured
+	 * {@link ChoiceOutcome} (used by the URI x-callback handler). Mirrors
+	 * {@link execute}'s envelope (one-page preflight + prompt-draft scope) so behaviour
+	 * is identical to the legacy void path; the only addition is surfacing the outcome.
+	 *
+	 * Nesting-safe: Template/Capture never run nested choices through this executor, so
+	 * the single result slot cannot be clobbered. An engine that completed without
+	 * recording success (and without aborting/throwing) hit a swallowed-failure branch,
+	 * which is reported as `error` — never silently as success.
+	 */
+	async executeWithOutcome(
+		choice: ITemplateChoice | ICaptureChoice,
+	): Promise<ChoiceOutcome> {
+		this.pendingAbort = null;
+		this.pendingResult = null;
+		this.beginExecutionContext();
+		const originLeaf = getOpenFileOriginLeaf(this.app);
+		const promptDraftStore = InputPromptDraftStore.getInstance();
+		promptDraftStore.beginExecutionScope();
+		try {
+			await this.runOnePagePreflightIfEnabled(choice);
+
+			if (choice.type === "Template") {
+				await this.onChooseTemplateType(choice as ITemplateChoice, originLeaf);
+			} else {
+				await this.onChooseCaptureType(choice as ICaptureChoice, originLeaf);
+			}
+
+			if (this.pendingAbort) {
+				promptDraftStore.rollbackExecutionScope();
+				const abort = this.consumeAbortSignal();
+				const isUser = abort instanceof UserCancelError;
+				return {
+					status: "cancelled",
+					cancelKind: isUser ? "user" : "aborted",
+					// Only surface the message for an involuntary abort (e.g. the
+					// non-interactive prompt guards). A user dismissal keeps its stable
+					// "cancelled by user" text and leaks no internals.
+					reason: isUser ? undefined : abort?.message,
+				};
+			}
+
+			promptDraftStore.commitExecutionScope();
+			const result = this.pendingResult;
+			this.pendingResult = null;
+			// No success recorded and no abort => the engine swallowed a failure.
+			return result ?? { status: "error" };
+		} catch (error) {
+			promptDraftStore.rollbackExecutionScope();
+			if (error instanceof UserCancelError) {
+				// Stable user-facing text; no internal message surfaced.
+				return { status: "cancelled", cancelKind: "user" };
+			}
+			if (error instanceof MacroAbortError) {
+				return { status: "cancelled", cancelKind: "aborted", reason: error.message };
+			}
+			reportError(error, "Error executing choice from URI");
+			return {
+				status: "error",
+				reason: error instanceof Error ? error.message : String(error),
+			};
+		} finally {
+			this.endExecutionContext();
+		}
+	}
+
+	private async runOnePagePreflightIfEnabled(choice: IChoice): Promise<void> {
+		// One-page preflight honoring per-choice override.
+		const globalEnabled = settingsStore.getState().onePageInputEnabled;
+		const override = choice.onePageInput;
+		// A remote interactive run (Raycast) has no in-app modal fallback, so it must
+		// collect a choice's declared inputs up front via the provider regardless of
+		// the global one-page setting - otherwise those inputs are never gathered and
+		// the run proceeds with them empty.
+		const remote = this.promptProvider != null;
+		const shouldUseOnePager =
+			override === "always" ||
+			(override !== "never" && (globalEnabled || remote));
+		if (
+			shouldUseOnePager &&
+			(choice.type === "Template" ||
+				choice.type === "Capture" ||
+				choice.type === "Macro")
+		) {
+			try {
+				await runOnePagePreflight(
+					this.app,
+					this.plugin as unknown as QuickAdd,
+					this,
+					choice,
+				);
+			} catch (error) {
+				if (isCancellationError(error)) {
+					throw new UserCancelError("One-page input cancelled by user");
+				}
+				throw error;
+			}
+		}
+	}
+
+	private async onChooseTemplateType(
+		templateChoice: ITemplateChoice,
+		originLeaf: WorkspaceLeaf | null,
+	): Promise<void> {
+		await new TemplateChoiceEngine(
+			this.app,
+			this.plugin,
+			templateChoice,
+			this,
+			originLeaf,
+		).run();
+	}
+
+	private async onChooseCaptureType(
+		captureChoice: ICaptureChoice,
+		originLeaf: WorkspaceLeaf | null,
+	) {
+		await new CaptureChoiceEngine(
+			this.app,
+			this.plugin,
+			captureChoice,
+			this,
+			originLeaf,
+		).run();
+	}
+
+	private async onChooseMacroType(
+		macroChoice: IMacroChoice,
+		originLeaf: WorkspaceLeaf | null,
+	) {
+		const macroEngine = new MacroChoiceEngine(
+			this.app,
+			this.plugin,
+			macroChoice,
+			this,
+			this.variables,
+			this.preloadedUserScripts,
+			undefined,
+			originLeaf,
+		);
+		await macroEngine.run();
+
+		Object.entries(macroEngine.params.variables).forEach(([key, value]) => {
+			this.variables.set(key, value as string);
+		});
+	}
+
+	private async onChooseMultiType(multiChoice: IMultiChoice): Promise<void> {
+		// Read through the accessor, not `.length`: a non-array value such as `{}`
+		// has an `undefined` length, so a bare `=== 0` check would slide past this
+		// guard and hand the picker a non-list to iterate (#1566).
+		const children = childChoicesOf(multiChoice);
+
+		// A remote or non-interactive run has nobody in front of the Obsidian
+		// window, so the folder picker below would sit unanswered on a desktop the
+		// caller cannot see - and before #1630 the run then reported done with the
+		// picker still open. Refuse instead. Signalled rather than thrown so the
+		// CLI serializes the same aborted frame every engine guard produces.
+		if (this.promptProvider || this.interactive === false) {
+			// The remedy differs per arm: a remote session has no ui flag to offer.
+			const remedy = this.promptProvider
+				? "Run one of its choices directly."
+				: "Run one of its choices directly, or re-run with the ui flag.";
+			this.signalAbort(
+				new ChoiceAbortError(
+					children.length === 0
+						? emptyFolderNoticeText(multiChoice)
+						: `"${multiChoice.name}" is a folder of choices, and picking from it needs someone at the window. ${remedy}`,
+				),
+			);
+			return;
+		}
+
+		// An empty folder run via command/URI would otherwise open a dead, item-less
+		// picker (no Back row is appended on this path) that reads as a broken command.
+		// Surface a Notice instead so the user knows the folder simply has nothing in it.
+		if (children.length === 0) {
+			new Notice(emptyFolderNoticeText(multiChoice));
+			return;
+		}
+
+		// Await the picker: the promise settles when the picked leaf choice
+		// finishes (or fails), or when the picker is dismissed - so this
+		// execute() no longer resolves while its own picker is open (#1630). A
+		// macro's Choice command therefore runs its remaining steps AFTER the
+		// picked child, and dismissing the picker cancels the run exactly like
+		// dismissing any other prompt mid-run.
+		await new Promise<void>((resolve, reject) => {
+			ChoiceSuggester.Open(this.plugin, children, {
+				choiceExecutor: this,
+				focusedProperty: this.focusedProperty,
+				triggerContext: this.triggerContext,
+				// Fall back to the folder name when no custom placeholder is set, matching the
+				// picker drill-down (choiceSuggester.onChooseMultiType) so both entry points to
+				// the same folder show the same search hint.
+				placeholder: multiChoice.placeholder?.trim() || multiChoice.name,
+				completion: (error) =>
+					error === undefined ? resolve() : reject(error),
+			});
+		});
+	}
+}

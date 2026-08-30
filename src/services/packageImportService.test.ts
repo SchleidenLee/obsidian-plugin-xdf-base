@@ -1,0 +1,2025 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { App } from "obsidian";
+import type IChoice from "../types/choices/IChoice";
+import type IMultiChoice from "../types/choices/IMultiChoice";
+import type IMacroChoice from "../types/choices/IMacroChoice";
+import type ITemplateChoice from "../types/choices/ITemplateChoice";
+import type ICaptureChoice from "../types/choices/ICaptureChoice";
+import type {
+	QuickAddPackage,
+	QuickAddPackageAsset,
+	QuickAddPackageChoice,
+} from "../types/packages/QuickAddPackage";
+import { QUICKADD_PACKAGE_SCHEMA_VERSION } from "../types/packages/QuickAddPackage";
+import { CommandType } from "../types/macros/CommandType";
+import type { IChoiceCommand } from "../types/macros/IChoiceCommand";
+import type { IConditionalCommand } from "../types/macros/Conditional/IConditionalCommand";
+import type { INestedChoiceCommand } from "../types/macros/QuickCommands/INestedChoiceCommand";
+import type { IUserScript } from "../types/macros/IUserScript";
+import { encodeToBase64 } from "../utils/base64";
+
+// Make uuid deterministic so duplicated-id remapping is verifiable.
+const uuidMock = vi.hoisted(() => ({ counter: 0 }));
+vi.mock("uuid", () => ({
+	v4: () => `uuid-${++uuidMock.counter}`,
+}));
+
+// The realpath/symlink write guard is desktop-only and a no-op against the
+// plain-object test adapter. Mock it so we can (a) keep that no-op default and
+// (b) assert how applyPackageImport WIRES it (called with destinations, as an
+// all-or-nothing pre-pass before any write). The guard's real containment logic
+// is covered by src/utils/vaultWriteGuards.test.ts with an actual symlink.
+vi.mock("../utils/vaultWriteGuards", () => ({
+	assertWriteStaysInVault: vi.fn(async () => {}),
+	VaultWriteEscapeError: class VaultWriteEscapeError extends Error {},
+}));
+
+import {
+	parseQuickAddPackage,
+	readQuickAddPackage,
+	analysePackage,
+	analysePackagePreview,
+	applyPackageImport,
+} from "./packageImportService";
+import { buildPackage } from "./packageExportService";
+import { assertWriteStaysInVault } from "../utils/vaultWriteGuards";
+import type {
+	ChoiceImportDecision,
+	AssetImportDecision,
+} from "./packageImportService";
+const { createUserScriptSecretRef } = await import("../utils/userScriptSecrets");
+
+// --- Fake app / vault -------------------------------------------------------
+
+interface FakeVaultState {
+	existingPaths: Set<string>;
+	writes: Map<string, string>;
+	createdFolders: string[];
+	existThrowsFor?: Set<string>;
+}
+
+function createFakeApp(initialExisting: string[] = []): {
+	app: App;
+	state: FakeVaultState;
+	adapter: { exists: ReturnType<typeof vi.fn> };
+} {
+	const state: FakeVaultState = {
+		existingPaths: new Set(initialExisting),
+		writes: new Map(),
+		createdFolders: [],
+	};
+
+	const adapter = {
+		exists: vi.fn(async (path: string) => {
+			if (state.existThrowsFor?.has(path)) {
+				throw new Error(`boom: ${path}`);
+			}
+			return state.existingPaths.has(path);
+		}),
+		read: vi.fn(async (path: string) => {
+			const content = state.writes.get(path);
+			if (content === undefined) {
+				throw new Error(`no file at ${path}`);
+			}
+			return content;
+		}),
+		write: vi.fn(async (path: string, content: string) => {
+			state.writes.set(path, content);
+			state.existingPaths.add(path);
+		}),
+	};
+
+	const app = {
+		vault: {
+			adapter,
+			// isVaultCaseInsensitive probes a case-swapped variant of configDir;
+			// seed ".OBSIDIAN" into existing paths to simulate a case-insensitive vault.
+			configDir: ".obsidian",
+			createFolder: vi.fn(async (path: string) => {
+				state.createdFolders.push(path);
+				state.existingPaths.add(path);
+			}),
+		},
+	} as unknown as App;
+
+	return { app, state, adapter };
+}
+
+// --- Fixture builders -------------------------------------------------------
+
+function makeChoice(
+	id: string,
+	name: string,
+	type: IChoice["type"],
+	overrides: Partial<IChoice> = {},
+): IChoice {
+	return {
+		id,
+		name,
+		type,
+		command: false,
+		...overrides,
+	} as IChoice;
+}
+
+function makeMulti(
+	id: string,
+	name: string,
+	children: IChoice[] = [],
+): IMultiChoice {
+	return {
+		id,
+		name,
+		type: "Multi",
+		command: false,
+		collapsed: false,
+		choices: children,
+	} as IMultiChoice;
+}
+
+function makePackageChoice(
+	choice: IChoice,
+	parentChoiceId: string | null = null,
+	pathHint: string[] = [],
+): QuickAddPackageChoice {
+	return { choice, parentChoiceId, pathHint };
+}
+
+function makePackage(
+	overrides: Partial<QuickAddPackage> = {},
+): QuickAddPackage {
+	return {
+		schemaVersion: QUICKADD_PACKAGE_SCHEMA_VERSION,
+		quickAddVersion: "1.0.0",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		rootChoiceIds: [],
+		choices: [],
+		assets: [],
+		...overrides,
+	};
+}
+
+function decisions(
+	entries: Array<[string, ChoiceImportDecision["mode"]]>,
+): ChoiceImportDecision[] {
+	return entries.map(([choiceId, mode]) => ({ choiceId, mode }));
+}
+
+beforeEach(() => {
+	uuidMock.counter = 0;
+	// Default the write guard back to a no-op so a per-test override (the
+	// pre-pass wiring test) never leaks into other cases.
+	vi.mocked(assertWriteStaysInVault).mockReset();
+	vi.mocked(assertWriteStaysInVault).mockImplementation(async () => {});
+});
+
+// --- parseQuickAddPackage ---------------------------------------------------
+
+describe("parseQuickAddPackage", () => {
+	it("parses a valid package payload", () => {
+		const pkg = makePackage({
+			rootChoiceIds: ["a"],
+			choices: [makePackageChoice(makeChoice("a", "A", "Template"))],
+		});
+		const result = parseQuickAddPackage(JSON.stringify(pkg));
+		expect(result.schemaVersion).toBe(QUICKADD_PACKAGE_SCHEMA_VERSION);
+		expect(result.choices).toHaveLength(1);
+		expect(result.choices[0].choice.id).toBe("a");
+	});
+
+	it("throws on invalid JSON", () => {
+		expect(() => parseQuickAddPackage("{not json")).toThrow(
+			/not valid JSON/,
+		);
+	});
+
+	it("throws when the payload is not a QuickAdd package", () => {
+		expect(() => parseQuickAddPackage(JSON.stringify({ foo: "bar" }))).toThrow(
+			/not a valid QuickAdd package/,
+		);
+	});
+
+	it("throws a version-specific error when the schema version is newer than supported", () => {
+		const future = {
+			...makePackage(),
+			schemaVersion: QUICKADD_PACKAGE_SCHEMA_VERSION + 1,
+		};
+		expect(() => parseQuickAddPackage(JSON.stringify(future))).toThrow(
+			/newer than this plugin supports/,
+		);
+	});
+
+	it("rejects a package whose choices are missing required fields", () => {
+		const bad = makePackage({
+			choices: [{ choice: { id: "x" }, parentChoiceId: null, pathHint: [] }],
+		} as unknown as Partial<QuickAddPackage>);
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/not a valid QuickAdd package/,
+		);
+	});
+
+	it("rejects a package with an invalid asset kind", () => {
+		const bad = makePackage({
+			assets: [
+				{
+					kind: "not-a-kind",
+					originalPath: "scripts/x.js",
+					contentEncoding: "base64",
+					content: "",
+				},
+			],
+		} as unknown as Partial<QuickAddPackage>);
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/not a valid QuickAdd package/,
+		);
+	});
+
+	it("rejects a package with duplicate asset originalPaths", () => {
+		// Two assets at the same path is last-write-wins on disk while the review
+		// pane resolves the FIRST match (decodeAssetPreview): a crafted package could
+		// show benign content while malicious content lands on disk. Reject at the
+		// untrusted-input boundary so reviewed bytes always equal written bytes.
+		const bad = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/x.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => 'benign';"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts/x.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => exfiltrate();"),
+				},
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/duplicate asset path/i,
+		);
+	});
+
+	it("rejects assets whose paths differ only by slash normalization", () => {
+		// "scripts//x.js" and "scripts/x.js" are distinct strings but normalize to one
+		// on-disk destination, so they still collide last-write-wins. Key the dedup on
+		// the normalized path the writer uses, not the raw string.
+		const bad = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/x.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => 'benign';"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts//x.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => exfiltrate();"),
+				},
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/duplicate asset path/i,
+		);
+	});
+
+	it("rejects duplicate EMPTY asset paths (falsy path must still fail closed)", () => {
+		// isPackageAsset accepts originalPath: "" (string), so two empty paths must not
+		// slip the duplicate gate via a truthiness check on the returned path.
+		const bad = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "",
+					contentEncoding: "base64",
+					content: encodeToBase64("benign"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "",
+					contentEncoding: "base64",
+					content: encodeToBase64("evil"),
+				},
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/duplicate asset path/i,
+		);
+	});
+
+	it("rejects a Multi inline child that DIVERGES from its same-id top-level entry", () => {
+		// Disclosure bypass: the preview walks the benign top-level entry and SKIPS
+		// the same-id inline child (entryIds.has -> continue), while applyPackageImport
+		// installs the inline child and drops the entry. A crafted package pairs a
+		// benign entry (runOnStartup:false, no commands) with a malicious inline child
+		// (runOnStartup:true + an Obsidian command) so the import auto-runs an
+		// undisclosed macro on startup with hasCritical=false. Reject at the boundary.
+		const maliciousInline: IChoice = {
+			id: "m",
+			name: "M",
+			type: "Macro",
+			command: false,
+			runOnStartup: true,
+			macro: {
+				id: "macro-m",
+				name: "M",
+				commands: [
+					{
+						id: "c1",
+						name: "Toggle",
+						type: CommandType.Obsidian,
+						commandId: "app:toggle-left-sidebar",
+					},
+				],
+			},
+		} as unknown as IChoice;
+		const benignEntry: IChoice = {
+			id: "m",
+			name: "M",
+			type: "Macro",
+			command: false,
+			runOnStartup: false,
+			macro: { id: "macro-m", name: "M", commands: [] },
+		} as unknown as IChoice;
+		const folder = makeMulti("folder", "Folder", [maliciousInline]);
+		const bad = makePackage({
+			rootChoiceIds: ["folder"],
+			choices: [
+				makePackageChoice(folder, null, ["Folder"]),
+				makePackageChoice(benignEntry, "folder", ["Folder", "M"]),
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/conflicting definitions for choice "m"/,
+		);
+	});
+
+	it("rejects divergence even when only a single field (runOnStartup) differs", () => {
+		// The cleanest abuse needs no bundled asset: runOnStartup is a critical row
+		// derived purely from the choice during the walk. A one-bit divergence between
+		// the benign entry and the installed inline copy must still fail closed.
+		const inline = {
+			id: "m",
+			name: "M",
+			type: "Macro",
+			command: false,
+			runOnStartup: true,
+			macro: { id: "macro-m", name: "M", commands: [] },
+		} as unknown as IChoice;
+		const entry = {
+			...inline,
+			runOnStartup: false,
+		} as unknown as IChoice;
+		const bad = makePackage({
+			rootChoiceIds: ["folder"],
+			choices: [
+				makePackageChoice(makeMulti("folder", "Folder", [inline]), null, [
+					"Folder",
+				]),
+				makePackageChoice(entry, "folder", ["Folder", "M"]),
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/conflicting definitions/,
+		);
+	});
+
+	it("accepts a nested package whose inline child EQUALS its same-id entry", () => {
+		// The legitimate exported shape: the child appears both inline in its parent
+		// Multi and as its own entry, but the two are identical. This must still parse.
+		const child = makeChoice("child", "Child", "Template");
+		const parent = makeMulti("parent", "Parent", [child]);
+		const ok = makePackage({
+			rootChoiceIds: ["parent"],
+			choices: [
+				makePackageChoice(parent, null, ["Parent"]),
+				makePackageChoice(child, "parent", ["Parent", "Child"]),
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(ok))).not.toThrow();
+	});
+
+	it("accepts identical appearances that differ only in JSON key order", () => {
+		// The consistency check is key-order-insensitive, so a re-serialized-but-equal
+		// package (e.g. round-tripped through a tool that reorders object keys) is not
+		// wrongly rejected.
+		const inlineRaw = `{"type":"Template","id":"child","name":"Child","command":false}`;
+		const entryRaw = `{"command":false,"name":"Child","id":"child","type":"Template"}`;
+		const raw = `{
+			"schemaVersion": 1,
+			"quickAddVersion": "1.18.0",
+			"createdAt": "2026-06-01T00:00:00.000Z",
+			"rootChoiceIds": ["parent"],
+			"choices": [
+				{ "choice": {"id":"parent","name":"Parent","type":"Multi","command":false,"collapsed":false,"choices":[${inlineRaw}]}, "pathHint": ["Parent"], "parentChoiceId": null },
+				{ "choice": ${entryRaw}, "pathHint": ["Parent","Child"], "parentChoiceId": "parent" }
+			],
+			"assets": []
+		}`;
+		expect(() => parseQuickAddPackage(raw)).not.toThrow();
+	});
+
+	it("accepts a real exported package round-trip (no false rejection of runOnStartup macros)", async () => {
+		// Gold anti-false-rejection proof: build a package from a live nested tree the
+		// SAME way the exporter does, then parse it. buildPackage emits the child both
+		// inline in its parent and as its own entry; both are clones of one source, so
+		// the consistency check must accept it - even though the macro is runOnStartup.
+		const { app } = createFakeApp();
+		const childMacro = {
+			id: "child",
+			name: "Child",
+			type: "Macro",
+			command: false,
+			runOnStartup: true,
+			macro: {
+				id: "macro-child",
+				name: "Child",
+				commands: [
+					{
+						id: "c1",
+						name: "Toggle",
+						type: CommandType.Obsidian,
+						commandId: "app:toggle-left-sidebar",
+					},
+				],
+			},
+		} as unknown as IChoice;
+		const parent = makeMulti("parent", "Parent", [childMacro]);
+		const { pkg } = await buildPackage(app, {
+			choices: [parent],
+			rootChoiceIds: ["parent"],
+			quickAddVersion: "1.18.0",
+			createdAt: "2026-06-01T00:00:00.000Z",
+		});
+		// The exporter really did emit both appearances of "child".
+		const childAppearances = pkg.choices.filter((c) => c.choice.id === "child");
+		expect(childAppearances.length).toBe(1); // one flat entry
+		const parentEntry = pkg.choices.find((c) => c.choice.id === "parent");
+		expect((parentEntry?.choice as IMultiChoice).choices![0].id).toBe("child"); // + inline
+		// And the consistency check accepts it.
+		expect(() => parseQuickAddPackage(JSON.stringify(pkg))).not.toThrow();
+	});
+
+	it("rejects an importable child its declared parent does not carry inline", () => {
+		// applyPackageImport skips a parented child (trusting the parent's subtree to
+		// install it) but remapChoiceTree only keeps children listed INLINE in the
+		// parent. A hand-edited package where entry "child" names parentChoiceId="parent"
+		// while "parent".choices omits it would import "child" nowhere — silently
+		// dropped while the modal listed it and reported success. Fail closed here.
+		const parent = makeMulti("parent", "Parent", []); // does NOT list "child"
+		const child = makeChoice("child", "Child", "Template");
+		const bad = makePackage({
+			rootChoiceIds: ["parent"],
+			choices: [
+				makePackageChoice(parent, null, ["Parent"]),
+				makePackageChoice(child, "parent", ["Parent", "Child"]),
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/names a parent that does not list it/i,
+		);
+	});
+
+	it("rejects a child whose declared parent entry is not a Multi", () => {
+		// parentChoiceId pointing at a non-container (e.g. a Template) is the same
+		// silent-drop shape: the importer skips the child as "parent-carried" but a
+		// Template has no inline choices to carry it.
+		const parent = makeChoice("parent", "Parent", "Template");
+		const child = makeChoice("child", "Child", "Template");
+		const bad = makePackage({
+			rootChoiceIds: ["parent"],
+			choices: [
+				makePackageChoice(parent, null, ["Parent"]),
+				makePackageChoice(child, "parent", ["Parent", "Child"]),
+			],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(bad))).toThrow(
+			/names a parent that does not list it/i,
+		);
+	});
+
+	it("accepts a child whose declared parent is NOT in the package", () => {
+		// The legit excluded-parent shape: the parent Multi was excluded from the
+		// export while the child was pulled in (e.g. as a macro dependency). The
+		// importer routes such a child to its existing-vault parent / root, so it must
+		// not be rejected at the boundary.
+		const child = makeChoice("child", "Child", "Template");
+		const ok = makePackage({
+			rootChoiceIds: ["child"],
+			choices: [makePackageChoice(child, "missing-parent", ["Missing", "Child"])],
+		});
+		expect(() => parseQuickAddPackage(JSON.stringify(ok))).not.toThrow();
+	});
+});
+
+// --- readQuickAddPackage ----------------------------------------------------
+
+describe("readQuickAddPackage", () => {
+	it("throws on an empty path", async () => {
+		const { app } = createFakeApp();
+		await expect(readQuickAddPackage(app, "   ")).rejects.toThrow(
+			/cannot be empty/,
+		);
+	});
+
+	it("throws when the file does not exist", async () => {
+		const { app } = createFakeApp();
+		await expect(
+			readQuickAddPackage(app, "packages/missing.json"),
+		).rejects.toThrow(/Package file not found/);
+	});
+
+	it("normalizes the path, reads, and parses the package", async () => {
+		const { app, state } = createFakeApp();
+		const pkg = makePackage({
+			rootChoiceIds: ["a"],
+			choices: [makePackageChoice(makeChoice("a", "A", "Template"))],
+		});
+		// Windows-style separators get normalized to POSIX by normalizePath stub.
+		state.existingPaths.add("packages/p.json");
+		state.writes.set("packages/p.json", JSON.stringify(pkg));
+
+		const loaded = await readQuickAddPackage(app, "packages\\p.json");
+		expect(loaded.path).toBe("packages/p.json");
+		expect(loaded.pkg.choices[0].choice.id).toBe("a");
+	});
+
+	// Security: the read entry point is reached with an untrusted `path` (the CLI
+	// `path=` flag, the GUI file picker). It must reject any path that escapes the
+	// vault BEFORE touching the filesystem, so a crafted "../../../etc/passwd" can
+	// never disclose an out-of-vault file. normalizePath does not resolve "..".
+	it.each([
+		"../../../etc/passwd",
+		"../secret.json",
+		"packages/../../escape.json",
+		"/etc/passwd",
+		"C:/secret.json",
+		"C:\\secret.json",
+		"..\\..\\..\\etc\\passwd",
+		"\\\\server\\share\\secret.json",
+	])("refuses to read an out-of-vault package path: %s", async (escaping) => {
+		const { app, adapter } = createFakeApp();
+		await expect(readQuickAddPackage(app, escaping)).rejects.toThrow(
+			/Refusing to read a package outside the vault/,
+		);
+		// No filesystem touch at all. `adapter.exists` is the first adapter call and
+		// the read only runs after a successful existence check, so exists-not-called
+		// proves adapter.read never ran either.
+		expect(adapter.exists).not.toHaveBeenCalled();
+	});
+});
+
+// --- analysePackage ---------------------------------------------------------
+
+describe("analysePackage", () => {
+	it("flags choice conflicts for ids that already exist (incl. nested)", async () => {
+		const { app } = createFakeApp();
+		const existing: IChoice[] = [
+			makeMulti("parent", "Parent", [makeChoice("nested", "Nested", "Template")]),
+		];
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(makeChoice("nested", "Nested", "Template"), null, [
+					"Parent",
+				]),
+				makePackageChoice(makeChoice("fresh", "Fresh", "Template")),
+			],
+		});
+
+		const analysis = await analysePackage(app, existing, pkg);
+		expect(analysis.choiceConflicts).toEqual([
+			{
+				choiceId: "nested",
+				name: "Nested",
+				parentChoiceId: null,
+				pathHint: ["Parent"],
+				exists: true,
+			},
+			{
+				choiceId: "fresh",
+				name: "Fresh",
+				parentChoiceId: null,
+				pathHint: [],
+				exists: false,
+			},
+		]);
+	});
+
+	it("defaults missing pathHint to an empty array", async () => {
+		const { app } = createFakeApp();
+		const entry = {
+			choice: makeChoice("a", "A", "Template"),
+			parentChoiceId: null,
+		} as unknown as QuickAddPackageChoice;
+		const pkg = makePackage({ choices: [entry] });
+
+		const analysis = await analysePackage(app, [], pkg);
+		expect(analysis.choiceConflicts[0].pathHint).toEqual([]);
+	});
+
+	it("reports asset conflicts based on vault existence", async () => {
+		const { app } = createFakeApp(["scripts/exists.js"]);
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/exists.js",
+					contentEncoding: "base64",
+					content: "",
+				},
+				{
+					kind: "template",
+					originalPath: "templates/new.md",
+					contentEncoding: "base64",
+					content: "",
+				},
+			],
+		});
+
+		const analysis = await analysePackage(app, [], pkg);
+		expect(analysis.assetConflicts).toEqual([
+			{ originalPath: "scripts/exists.js", exists: true, kind: "user-script" },
+			{ originalPath: "templates/new.md", exists: false, kind: "template" },
+		]);
+	});
+});
+
+// --- Path-traversal containment (security) ----------------------------------
+
+describe("existence probes stay inside the vault boundary", () => {
+	const ESCAPING_PATHS = [
+		"../../../etc/passwd",
+		"/etc/passwd",
+		"C:\\Windows\\System32\\drivers\\etc\\hosts",
+		"\\\\server\\share\\secret",
+	];
+
+	it("never stats an out-of-vault asset originalPath in analysePackage", async () => {
+		const { app, adapter } = createFakeApp();
+		const pkg = makePackage({
+			assets: ESCAPING_PATHS.map((originalPath) => ({
+				kind: "template" as const,
+				originalPath,
+				contentEncoding: "base64" as const,
+				content: "",
+			})),
+		});
+
+		const analysis = await analysePackage(app, [], pkg);
+
+		// Each escaping path is reported as not-present WITHOUT a filesystem probe.
+		for (const originalPath of ESCAPING_PATHS) {
+			expect(adapter.exists).not.toHaveBeenCalledWith(originalPath);
+			expect(
+				analysis.assetConflicts.find((c) => c.originalPath === originalPath)
+					?.exists,
+			).toBe(false);
+		}
+	});
+
+	it("never stats an out-of-vault path in analysePackagePreview and surfaces it as missing", async () => {
+		const { app, adapter } = createFakeApp();
+		// A choice that REFERENCES (does not bundle) an out-of-vault template path.
+		const escaping = "../../../etc/passwd";
+		const templateChoice = makeChoice("t", "T", "Template", {
+			templatePath: escaping,
+		} as Partial<IChoice>);
+		const pkg = makePackage({
+			rootChoiceIds: ["t"],
+			choices: [makePackageChoice(templateChoice)],
+		});
+
+		const preview = await analysePackagePreview(app, [], pkg);
+
+		expect(adapter.exists).not.toHaveBeenCalledWith(escaping);
+		// Honest preview: an out-of-vault reference is "missing", never silently
+		// reported as a present/reused vault file.
+		expect(preview.missingReferences.map((m) => m.path)).toContain(escaping);
+	});
+
+	it("still probes in-vault config-dir references (no over-rejection)", async () => {
+		const inVaultDotDir = ".obsidian/snippets/x.js";
+		const { app, adapter } = createFakeApp([inVaultDotDir]);
+		const templateChoice = makeChoice("t", "T", "Template", {
+			templatePath: inVaultDotDir,
+		} as Partial<IChoice>);
+		const pkg = makePackage({
+			rootChoiceIds: ["t"],
+			choices: [makePackageChoice(templateChoice)],
+		});
+
+		const preview = await analysePackagePreview(app, [], pkg);
+
+		// The in-vault dot-dir path IS probed and recognized as present, so it is
+		// NOT mislabeled as a missing reference.
+		expect(adapter.exists).toHaveBeenCalledWith(inVaultDotDir);
+		expect(preview.missingReferences.map((m) => m.path)).not.toContain(
+			inVaultDotDir,
+		);
+	});
+});
+
+describe("asset write containment (security)", () => {
+	it("rejects writing into a NESTED config/hidden directory", async () => {
+		for (const originalPath of [
+			"notes/.git/hooks/post-commit",
+			"docs/.obsidian/plugins/x/main.js",
+			"a/b/.trash/x.md",
+		]) {
+			const { app, state } = createFakeApp();
+			const pkg = makePackage({
+				assets: [
+					{
+						kind: "template",
+						originalPath,
+						contentEncoding: "base64",
+						content: encodeToBase64("payload"),
+					},
+				],
+			});
+
+			await expect(
+				applyPackageImport({
+					app,
+					existingChoices: [],
+					pkg,
+					choiceDecisions: [],
+					assetDecisions: [],
+				}),
+			).rejects.toThrow(/config directory/);
+			expect(state.writes.size).toBe(0);
+		}
+	});
+
+	it("runs the realpath guard as an all-or-nothing pre-pass before any write", async () => {
+		const { app, state } = createFakeApp();
+		// Second asset's destination "escapes"; the guard (mocked) throws for it.
+		vi.mocked(assertWriteStaysInVault).mockImplementation(
+			async (_app, destinationPath) => {
+				if (destinationPath === "scripts/escapes.js") {
+					throw new Error(
+						`Refusing to write to "${destinationPath}": it resolves (via a symlink) outside the vault.`,
+					);
+				}
+			},
+		);
+
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/safe.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("safe"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts/escapes.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("evil"),
+				},
+			],
+		});
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [],
+			}),
+		).rejects.toThrow(/outside the vault/);
+
+		// All-or-nothing: the lexically-safe, FIRST-ordered asset is NOT written,
+		// proving the guard ran as a pre-pass (not inline per-asset).
+		expect(state.writes.size).toBe(0);
+		// Wired with the resolved DESTINATION path, for every written asset.
+		expect(assertWriteStaysInVault).toHaveBeenCalledWith(app, "scripts/safe.js");
+		expect(assertWriteStaysInVault).toHaveBeenCalledWith(
+			app,
+			"scripts/escapes.js",
+		);
+	});
+
+	it("refuses two assets that resolve to the same on-disk destination", async () => {
+		// The import modal defaults every template/capture asset to
+		// `<templateFolder>/<basename>`, so two DISTINCT originalPaths sharing a
+		// basename collide on ONE file. Parse-time originalPath dedup can't see this
+		// (the paths differ); writing them in order is silent last-write-wins, so the
+		// bytes the user reviewed are not the bytes that land. The writer must refuse.
+		const { app, state } = createFakeApp();
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "template",
+					originalPath: "A/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => 'benign';"),
+				},
+				{
+					kind: "template",
+					originalPath: "B/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => exfiltrate();"),
+				},
+			],
+		});
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				// Mirrors defaultAssetDestination: both basenames land in one folder.
+				assetDecisions: [
+					{
+						originalPath: "A/payload.js",
+						destinationPath: "Templates/payload.js",
+						mode: "write",
+					},
+					{
+						originalPath: "B/payload.js",
+						destinationPath: "Templates/payload.js",
+						mode: "write",
+					},
+				],
+			}),
+		).rejects.toThrow(/resolve to the same destination/);
+
+		// All-or-nothing: nothing is written, so no silent last-write-wins.
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("refuses two assets that collide only by case (case-insensitive vaults)", async () => {
+		// macOS/Windows vaults are case-insensitive, so "Scripts/x.js" and
+		// "scripts/x.js" are ONE physical file even though their normalized strings
+		// differ. Seed the case-swapped configDir so the case-sensitivity probe
+		// reports insensitive; the collision key then folds and refuses the import.
+		const { app, state } = createFakeApp([".OBSIDIAN"]);
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "Scripts/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => 'benign';"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("module.exports = () => exfiltrate();"),
+				},
+			],
+		});
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [],
+			}),
+		).rejects.toThrow(/resolve to the same destination/);
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("allows two case-distinct destinations on a case-sensitive vault", async () => {
+		// On Linux/case-sensitive vaults "Scripts/x.js" and "scripts/x.js" are TWO
+		// distinct files a legitimate package may ship. With the probe reporting
+		// case-sensitive (no swapped configDir seeded), both must import, not throw.
+		const { app, state } = createFakeApp();
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "Scripts/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("benign"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("other"),
+				},
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result.writtenAssets).toContain("Scripts/payload.js");
+		expect(result.writtenAssets).toContain("scripts/payload.js");
+		expect(state.writes.size).toBe(2);
+	});
+
+	it("allows a destination collision when the colliding asset is skipped", async () => {
+		// A skipped asset never writes, so it cannot collide. Only the surviving
+		// (non-skipped) asset lands; no false rejection.
+		const { app, state } = createFakeApp();
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "template",
+					originalPath: "A/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("benign"),
+				},
+				{
+					kind: "template",
+					originalPath: "B/payload.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("evil"),
+				},
+			],
+		});
+
+		await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [
+				{
+					originalPath: "A/payload.js",
+					destinationPath: "Templates/payload.js",
+					mode: "write",
+				},
+				{
+					originalPath: "B/payload.js",
+					destinationPath: "Templates/payload.js",
+					mode: "skip",
+				},
+			],
+		});
+
+		expect(state.writes.get("Templates/payload.js")).toBe("benign");
+		expect(state.writes.size).toBe(1);
+	});
+
+	it("aborts on a vault-escaping destination even when that asset is marked skip", async () => {
+		// Consistency: the lexical guard already aborts the whole import on an
+		// absolute/".." destination regardless of mode; the realpath pre-pass does
+		// the same for a symlink escape. A package carrying a vault-escaping asset is
+		// refused wholesale and surfaced loudly, not silently dropped via "skip".
+		const { app, state } = createFakeApp();
+		vi.mocked(assertWriteStaysInVault).mockImplementation(
+			async (_app, destinationPath) => {
+				if (destinationPath === "linked/evil.js") {
+					throw new Error(
+						`Refusing to write to "${destinationPath}": resolves outside the vault.`,
+					);
+				}
+			},
+		);
+
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/safe.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("safe"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "linked/evil.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("evil"),
+				},
+			],
+		});
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [
+					{
+						originalPath: "linked/evil.js",
+						destinationPath: "linked/evil.js",
+						mode: "skip",
+					},
+				],
+			}),
+		).rejects.toThrow(/outside the vault/);
+
+		// All-or-nothing: nothing is written, including the lexically-safe asset.
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("aborts on a lexically-unsafe destination even when that asset is marked skip", async () => {
+		// Documents the pre-existing lexical behavior the realpath pre-pass matches.
+		const { app, state } = createFakeApp();
+		const pkg = makePackage({
+			assets: [
+				{
+					kind: "template",
+					originalPath: "../evil.md",
+					contentEncoding: "base64",
+					content: encodeToBase64("evil"),
+				},
+			],
+		});
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [
+					{
+						originalPath: "../evil.md",
+						destinationPath: "../evil.md",
+						mode: "skip",
+					},
+				],
+			}),
+		).rejects.toThrow(/traversal|\.\./);
+		expect(state.writes.size).toBe(0);
+	});
+});
+
+// --- applyPackageImport: basic insertion -----------------------------------
+
+describe("applyPackageImport - root insertion", () => {
+	it("appends a brand-new root choice", async () => {
+		const { app } = createFakeApp();
+		const choice = makeChoice("new", "New", "Template");
+		choice.icon = "star";
+		const pkg = makePackage({
+			choices: [makePackageChoice(choice)],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([["new", "import"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.addedChoiceIds).toEqual(["new"]);
+		expect(result.overwrittenChoiceIds).toEqual([]);
+		expect(result.updatedChoices.map((c) => c.id)).toEqual(["new"]);
+		expect(result.updatedChoices[0].icon).toBe("star");
+	});
+
+	it("overwrites an existing root choice in place", async () => {
+		const { app } = createFakeApp();
+		const existing: IChoice[] = [makeChoice("dup", "Old Name", "Template")];
+		const pkg = makePackage({
+			choices: [makePackageChoice(makeChoice("dup", "New Name", "Template"))],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: existing,
+			pkg,
+			choiceDecisions: decisions([["dup", "overwrite"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.overwrittenChoiceIds).toEqual(["dup"]);
+		expect(result.addedChoiceIds).toEqual([]);
+		expect(result.updatedChoices).toHaveLength(1);
+		expect(result.updatedChoices[0].name).toBe("New Name");
+	});
+
+	it("does not mutate the passed-in existingChoices array", async () => {
+		const { app } = createFakeApp();
+		const existing: IChoice[] = [makeChoice("dup", "Old Name", "Template")];
+		const pkg = makePackage({
+			choices: [makePackageChoice(makeChoice("dup", "New Name", "Template"))],
+		});
+
+		await applyPackageImport({
+			app,
+			existingChoices: existing,
+			pkg,
+			choiceDecisions: decisions([["dup", "overwrite"]]),
+			assetDecisions: [],
+		});
+
+		// Original input untouched (deepClone is used internally).
+		expect(existing).toHaveLength(1);
+		expect(existing[0].name).toBe("Old Name");
+	});
+
+	it("skips a choice marked skip and reports it", async () => {
+		const { app } = createFakeApp();
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(makeChoice("keep", "Keep", "Template")),
+				makePackageChoice(makeChoice("drop", "Drop", "Template")),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([
+				["keep", "import"],
+				["drop", "skip"],
+			]),
+			assetDecisions: [],
+		});
+
+		expect(result.skippedChoiceIds).toEqual(["drop"]);
+		expect(result.addedChoiceIds).toEqual(["keep"]);
+		expect(result.updatedChoices.map((c) => c.id)).toEqual(["keep"]);
+	});
+});
+
+// --- applyPackageImport: parent/child handling ------------------------------
+
+describe("applyPackageImport - parent/child trees", () => {
+	it("inserts the multi parent (with children) and skips re-inserting children", async () => {
+		const { app } = createFakeApp();
+		const child = makeChoice("child", "Child", "Template");
+		const parent = makeMulti("parent", "Parent", [child]);
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(parent),
+				makePackageChoice(child, "parent", ["Parent"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([
+				["parent", "import"],
+				["child", "import"],
+			]),
+			assetDecisions: [],
+		});
+
+		// Parent added once at root; child handled inside the parent's tree.
+		expect(result.addedChoiceIds).toEqual(["parent"]);
+		expect(result.updatedChoices).toHaveLength(1);
+		const insertedParent = result.updatedChoices[0] as IMultiChoice;
+		expect(insertedParent.id).toBe("parent");
+		expect(insertedParent.choices!.map((c) => c.id)).toEqual(["child"]);
+	});
+
+	it("inserts a new child under an already-existing parent multi", async () => {
+		const { app } = createFakeApp();
+		const existing: IChoice[] = [makeMulti("parent", "Parent", [])];
+		const child = makeChoice("child", "Child", "Template");
+		const pkg = makePackage({
+			choices: [makePackageChoice(child, "parent", ["Parent"])],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: existing,
+			pkg,
+			choiceDecisions: decisions([["child", "import"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.addedChoiceIds).toEqual(["child"]);
+		const parent = result.updatedChoices[0] as IMultiChoice;
+		expect(parent.choices!.map((c) => c.id)).toEqual(["child"]);
+	});
+
+	it("falls back to pathHint to locate a parent multi by name", async () => {
+		const { app } = createFakeApp();
+		// Existing parent has a DIFFERENT id than the package's parentChoiceId,
+		// so id-based lookup fails and the pathHint name lookup kicks in.
+		const existing: IChoice[] = [makeMulti("local-parent-id", "Parent", [])];
+		const child = makeChoice("child", "Child", "Template");
+		// pathHint is the full path INCLUDING the choice's own name; the parent
+		// path is everything before the last segment (slice(0, -1) === ["Parent"]).
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(child, "missing-parent-id", ["Parent", "Child"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: existing,
+			pkg,
+			choiceDecisions: decisions([["child", "import"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.addedChoiceIds).toEqual(["child"]);
+		const parent = result.updatedChoices[0] as IMultiChoice;
+		expect(parent.choices!.map((c) => c.id)).toEqual(["child"]);
+	});
+
+	it("adds an orphan child to the root when its parent cannot be found", async () => {
+		const { app } = createFakeApp();
+		const child = makeChoice("child", "Child", "Template");
+		const pkg = makePackage({
+			// parentChoiceId references something that's not in the package and
+			// no matching pathHint exists in the (empty) destination tree.
+			choices: [
+				makePackageChoice(child, "ghost-parent", ["Nonexistent", "Child"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([["child", "import"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.addedChoiceIds).toEqual(["child"]);
+		expect(result.updatedChoices.map((c) => c.id)).toEqual(["child"]);
+	});
+
+	it("treats a child importable even when its in-package parent is skipped", async () => {
+		const { app } = createFakeApp();
+		const existing: IChoice[] = [makeMulti("parent", "Parent", [])];
+		const child = makeChoice("child", "Child", "Template");
+		const parent = makeMulti("parent", "Parent", [child]);
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(parent),
+				makePackageChoice(child, "parent", ["Parent"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: existing,
+			pkg,
+			choiceDecisions: decisions([
+				["parent", "skip"],
+				["child", "import"],
+			]),
+			assetDecisions: [],
+		});
+
+		// Parent skipped, child should still be importable and land under the
+		// existing parent multi via id lookup.
+		expect(result.skippedChoiceIds).toEqual(["parent"]);
+		expect(result.addedChoiceIds).toEqual(["child"]);
+		const destParent = result.updatedChoices.find(
+			(c) => c.id === "parent",
+		) as IMultiChoice;
+		expect(destParent.choices!.map((c) => c.id)).toEqual(["child"]);
+	});
+});
+
+// --- applyPackageImport: duplicate / id remapping ---------------------------
+
+describe("applyPackageImport - duplicate mode and id remapping", () => {
+	it("assigns a fresh id when a choice is duplicated", async () => {
+		const { app } = createFakeApp();
+		const pkg = makePackage({
+			choices: [makePackageChoice(makeChoice("orig", "Orig", "Template"))],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([["orig", "duplicate"]]),
+			assetDecisions: [],
+		});
+
+		expect(result.addedChoiceIds).toEqual(["uuid-1"]);
+		expect(result.updatedChoices[0].id).toBe("uuid-1");
+		expect(result.updatedChoices[0].name).toBe("Orig");
+	});
+
+	it("strips user-script secrets from imported package choices", async () => {
+		const { app } = createFakeApp();
+		const macro = {
+			...makeChoice("macro", "Macro", "Macro"),
+			macro: {
+				id: "macro-id",
+				name: "M",
+				commands: [
+					{
+						id: "cmd",
+						name: "Run script",
+						type: CommandType.UserScript,
+						path: "Scripts/script.md",
+						settings: {
+							"API Key": "legacy-secret",
+							Token: createUserScriptSecretRef("local-secret-ref"),
+							Model: "gpt-4",
+						},
+					} as IUserScript,
+				],
+			},
+			runOnStartup: false,
+		} as IMacroChoice;
+		const pkg = makePackage({
+			choices: [makePackageChoice(macro)],
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "Scripts/script.md",
+					contentEncoding: "base64",
+					content: encodeToBase64(
+						[
+							"# Script note",
+							"",
+							"```js",
+							"module.exports = {",
+							"  settings: {",
+							"    options: {",
+							"      \"API Key\": { \"type\": \"secret\" },",
+							"      Token: { type: \"text\", secret: true },",
+							"      Model: { type: \"text\" },",
+							"    },",
+							"  },",
+							"  entry: () => {},",
+							"};",
+							"```",
+						].join("\n"),
+					),
+				},
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([["macro", "import"]]),
+			assetDecisions: [],
+		});
+
+		const inserted = result.updatedChoices[0] as IMacroChoice;
+		const command = inserted.macro.commands[0] as IUserScript;
+
+		expect(command.settings).toEqual({ Model: "gpt-4" });
+		expect(JSON.stringify(inserted)).not.toContain("legacy-secret");
+		expect(JSON.stringify(inserted)).not.toContain("local-secret-ref");
+		expect(JSON.stringify(inserted)).not.toContain("__quickaddSecret");
+	});
+
+	it("propagates duplication to descendants and regenerates macro/command ids", async () => {
+		const { app } = createFakeApp();
+		const macroChild = {
+			...makeChoice("macroChild", "MacroChild", "Macro"),
+			macro: {
+				id: "macro-orig",
+				name: "M",
+				commands: [
+					{
+						id: "cmd-orig",
+						name: "Run sibling",
+						type: CommandType.Choice,
+						choiceId: "macroChild",
+					} as IChoiceCommand,
+				],
+			},
+			runOnStartup: false,
+		} as IMacroChoice;
+		const parent = makeMulti("parent", "Parent", [macroChild]);
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(parent),
+				makePackageChoice(macroChild, "parent", ["Parent"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			// Only the parent is marked duplicate; the child should inherit it.
+			choiceDecisions: decisions([
+				["parent", "duplicate"],
+				["macroChild", "import"],
+			]),
+			assetDecisions: [],
+		});
+
+		const insertedParent = result.updatedChoices[0] as IMultiChoice;
+		// Parent and child both get new ids.
+		expect(insertedParent.id).not.toBe("parent");
+		const insertedMacro = insertedParent.choices![0] as IMacroChoice;
+		expect(insertedMacro.id).not.toBe("macroChild");
+		// Macro + command ids regenerated.
+		expect(insertedMacro.macro.id).not.toBe("macro-orig");
+		const cmd = insertedMacro.macro.commands[0] as IChoiceCommand;
+		expect(cmd.id).not.toBe("cmd-orig");
+		// Choice command pointing at the duplicated child gets remapped to the new id.
+		expect(cmd.choiceId).toBe(insertedMacro.id);
+	});
+
+	it("remaps Choice-command references to non-duplicated imported ids", async () => {
+		const { app } = createFakeApp();
+		const macro = {
+			...makeChoice("macro", "Macro", "Macro"),
+			macro: {
+				id: "macro-id",
+				name: "M",
+				commands: [
+					{
+						id: "cmd",
+						name: "Run target",
+						type: CommandType.Choice,
+						choiceId: "target",
+					} as IChoiceCommand,
+				],
+			},
+			runOnStartup: false,
+		} as IMacroChoice;
+		const target = makeChoice("target", "Target", "Template");
+		const pkg = makePackage({
+			choices: [makePackageChoice(macro), makePackageChoice(target)],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([
+				["macro", "import"],
+				["target", "import"],
+			]),
+			assetDecisions: [],
+		});
+
+		const insertedMacro = result.updatedChoices.find(
+			(c) => c.id === "macro",
+		) as IMacroChoice;
+		const cmd = insertedMacro.macro.commands[0] as IChoiceCommand;
+		// Not duplicated, so id stays the same.
+		expect(cmd.choiceId).toBe("target");
+	});
+
+	it("filters out non-importable children from a Multi during remap", async () => {
+		const { app } = createFakeApp();
+		const keepChild = makeChoice("keep", "Keep", "Template");
+		const dropChild = makeChoice("drop", "Drop", "Template");
+		const parent = makeMulti("parent", "Parent", [keepChild, dropChild]);
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(parent),
+				makePackageChoice(keepChild, "parent", ["Parent"]),
+				makePackageChoice(dropChild, "parent", ["Parent"]),
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([
+				["parent", "import"],
+				["keep", "import"],
+				["drop", "skip"],
+			]),
+			assetDecisions: [],
+		});
+
+		const insertedParent = result.updatedChoices[0] as IMultiChoice;
+		// The skipped child must not appear inside the imported parent's tree.
+		expect(insertedParent.choices!.map((c) => c.id)).toEqual(["keep"]);
+		expect(result.skippedChoiceIds).toContain("drop");
+	});
+});
+
+// --- applyPackageImport: assets ---------------------------------------------
+
+describe("applyPackageImport - assets", () => {
+	it("writes a new asset, ensures parent folders, and decodes base64 content", async () => {
+		const { app, state } = createFakeApp();
+		const content = "console.log('hi');";
+		const asset: QuickAddPackageAsset = {
+			kind: "user-script",
+			originalPath: "scripts/sub/run.js",
+			contentEncoding: "base64",
+			content: encodeToBase64(content),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result.writtenAssets).toEqual(["scripts/sub/run.js"]);
+		expect(state.writes.get("scripts/sub/run.js")).toBe(content);
+		// Parent folders created in order.
+		expect(state.createdFolders).toEqual(["scripts", "scripts/sub"]);
+	});
+
+	it("respects an explicit skip decision for an asset", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "templates/t.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+		const assetDecisions: AssetImportDecision[] = [
+			{
+				originalPath: "templates/t.md",
+				destinationPath: "templates/t.md",
+				mode: "skip",
+			},
+		];
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions,
+		});
+
+		expect(result.skippedAssets).toEqual(["templates/t.md"]);
+		expect(result.writtenAssets).toEqual([]);
+		expect(state.writes.has("templates/t.md")).toBe(false);
+	});
+
+	it("writes to a custom (normalized) destination path", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "templates/t.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+		const assetDecisions: AssetImportDecision[] = [
+			{
+				originalPath: "templates/t.md",
+				destinationPath: "renamed\\dest.md",
+				mode: "write",
+			},
+		];
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions,
+		});
+
+		expect(result.writtenAssets).toEqual(["renamed/dest.md"]);
+		expect(state.writes.get("renamed/dest.md")).toBe("body");
+	});
+
+	it("rejects traversal in an asset's original path", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "../escape.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [],
+			}),
+		).rejects.toThrow(/traversal|\.\./);
+
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("rejects traversal in an asset destination override", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "templates/t.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [
+					{
+						originalPath: "templates/t.md",
+						destinationPath: "../../evil.md",
+						mode: "write",
+					},
+				],
+			}),
+		).rejects.toThrow(/traversal|\.\./);
+
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("rejects an absolute asset destination override", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "templates/t.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [
+					{
+						originalPath: "templates/t.md",
+						destinationPath: "/abs/path.md",
+						mode: "write",
+					},
+				],
+			}),
+		).rejects.toThrow(/absolute path/);
+
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("rejects a Windows-style absolute asset destination override", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "templates/t.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [
+					{
+						originalPath: "templates/t.md",
+						destinationPath: "C:\\evil\\path.md",
+						mode: "write",
+					},
+				],
+			}),
+		).rejects.toThrow(/absolute path/);
+
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("rejects assets targeting dotfile config directories", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: ".obsidian/plugins/x/main.js",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [],
+			}),
+		).rejects.toThrow(/config directory/);
+
+		expect(state.writes.size).toBe(0);
+	});
+
+	it("rejects unsafe asset destinations before writing any asset", async () => {
+		const { app, state } = createFakeApp();
+		const safeAsset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "Templates/safe.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("safe"),
+		};
+		const unsafeAsset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: ".obsidian/plugins/x/main.js",
+			contentEncoding: "base64",
+			content: encodeToBase64("unsafe"),
+		};
+		const pkg = makePackage({ assets: [safeAsset, unsafeAsset] });
+
+		await expect(
+			applyPackageImport({
+				app,
+				existingChoices: [],
+				pkg,
+				choiceDecisions: [],
+				assetDecisions: [],
+			}),
+		).rejects.toThrow(/config directory/);
+
+		expect(state.writes.size).toBe(0);
+		expect(state.createdFolders).toEqual([]);
+	});
+
+	it("allows url-encoded traversal text as a literal filename", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "..%2fevil.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result.writtenAssets).toEqual(["..%2fevil.md"]);
+		expect(state.writes.get("..%2fevil.md")).toBe("body");
+	});
+
+	it("allows a legitimate asset path", async () => {
+		const { app, state } = createFakeApp();
+		const asset: QuickAddPackageAsset = {
+			kind: "template",
+			originalPath: "Templates/foo.md",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result.writtenAssets).toEqual(["Templates/foo.md"]);
+		expect(state.writes.get("Templates/foo.md")).toBe("body");
+	});
+
+	it("rewrites template/userscript/conditional paths to remapped destinations", async () => {
+		const { app } = createFakeApp();
+
+		const templateChoice = {
+			...makeChoice("tmpl", "Template choice", "Template"),
+			templatePath: "templates/orig.md",
+		} as ITemplateChoice;
+
+		const captureChoice = {
+			...makeChoice("cap", "Capture choice", "Capture"),
+			createFileIfItDoesntExist: {
+				enabled: true,
+				createWithTemplate: true,
+				template: "templates/orig.md",
+			},
+		} as ICaptureChoice;
+
+		const macroChoice = {
+			...makeChoice("macro", "Macro choice", "Macro"),
+			macro: {
+				id: "macro-id",
+				name: "M",
+				commands: [
+					{
+						id: "us",
+						name: "Script",
+						type: CommandType.UserScript,
+						path: "scripts/orig.js",
+						settings: {},
+					} as IUserScript,
+					{
+						id: "cond",
+						name: "Cond",
+						type: CommandType.Conditional,
+						condition: {
+							mode: "script",
+							scriptPath: "scripts/orig.js",
+						},
+						thenCommands: [
+							{
+								id: "nested",
+								name: "Nested",
+								type: CommandType.NestedChoice,
+								choice: {
+									...makeChoice("nestedTmpl", "Nested tmpl", "Template"),
+									templatePath: "templates/orig.md",
+								} as ITemplateChoice,
+							} as INestedChoiceCommand,
+						],
+						elseCommands: [],
+					} as IConditionalCommand,
+				],
+			},
+			runOnStartup: false,
+		} as IMacroChoice;
+
+		const pkg = makePackage({
+			choices: [
+				makePackageChoice(templateChoice),
+				makePackageChoice(captureChoice),
+				makePackageChoice(macroChoice),
+			],
+			assets: [
+				{
+					kind: "template",
+					originalPath: "templates/orig.md",
+					contentEncoding: "base64",
+					content: encodeToBase64("tmpl body"),
+				},
+				{
+					kind: "user-script",
+					originalPath: "scripts/orig.js",
+					contentEncoding: "base64",
+					content: encodeToBase64("script body"),
+				},
+			],
+		});
+
+		const assetDecisions: AssetImportDecision[] = [
+			{
+				originalPath: "templates/orig.md",
+				destinationPath: "templates/new.md",
+				mode: "write",
+			},
+			{
+				originalPath: "scripts/orig.js",
+				destinationPath: "scripts/new.js",
+				mode: "write",
+			},
+		];
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([
+				["tmpl", "import"],
+				["cap", "import"],
+				["macro", "import"],
+			]),
+			assetDecisions,
+		});
+
+		const insertedTemplate = result.updatedChoices.find(
+			(c) => c.id === "tmpl",
+		) as ITemplateChoice;
+		expect(insertedTemplate.templatePath).toBe("templates/new.md");
+
+		const insertedCapture = result.updatedChoices.find(
+			(c) => c.id === "cap",
+		) as ICaptureChoice;
+		expect(insertedCapture.createFileIfItDoesntExist.template).toBe(
+			"templates/new.md",
+		);
+
+		const insertedMacro = result.updatedChoices.find(
+			(c) => c.id === "macro",
+		) as IMacroChoice;
+		const userScript = insertedMacro.macro.commands[0] as IUserScript;
+		expect(userScript.path).toBe("scripts/new.js");
+		const conditional = insertedMacro.macro.commands[1] as IConditionalCommand;
+		expect(
+			(conditional.condition as { scriptPath: string }).scriptPath,
+		).toBe("scripts/new.js");
+		const nested = conditional.thenCommands[0] as INestedChoiceCommand;
+		expect((nested.choice as ITemplateChoice).templatePath).toBe(
+			"templates/new.md",
+		);
+	});
+
+	it("remaps a note-script command name (=path) when the asset is rewritten (#1065)", async () => {
+		const { app } = createFakeApp();
+		const macroChoice = {
+			...makeChoice("macro", "Macro choice", "Macro"),
+			macro: {
+				id: "macro-id",
+				name: "M",
+				commands: [
+					{
+						id: "us",
+						// Note-backed scripts carry the vault path as their name (+ member).
+						name: "scripts/orig.md::run",
+						type: CommandType.UserScript,
+						path: "scripts/orig.md",
+						settings: {},
+					} as IUserScript,
+				],
+			},
+			runOnStartup: false,
+		} as IMacroChoice;
+
+		const pkg = makePackage({
+			choices: [makePackageChoice(macroChoice)],
+			assets: [
+				{
+					kind: "user-script",
+					originalPath: "scripts/orig.md",
+					contentEncoding: "base64",
+					content: encodeToBase64("```js\nmodule.exports={run:()=>1}\n```"),
+				},
+			],
+		});
+
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: decisions([["macro", "import"]]),
+			assetDecisions: [
+				{
+					originalPath: "scripts/orig.md",
+					destinationPath: "scripts/new.md",
+					mode: "write",
+				},
+			],
+		});
+
+		const insertedMacro = result.updatedChoices.find(
+			(c) => c.id === "macro",
+		) as IMacroChoice;
+		const userScript = insertedMacro.macro.commands[0] as IUserScript;
+		expect(userScript.path).toBe("scripts/new.md");
+		// name must track the new path so member access + UI stay correct.
+		expect(userScript.name).toBe("scripts/new.md::run");
+	});
+
+	it("does not throw when adapter.exists rejects while checking an asset", async () => {
+		const { app, state } = createFakeApp();
+		state.existThrowsFor = new Set(["scripts/run.js"]);
+		const asset: QuickAddPackageAsset = {
+			kind: "user-script",
+			originalPath: "scripts/run.js",
+			contentEncoding: "base64",
+			content: encodeToBase64("body"),
+		};
+		const pkg = makePackage({ assets: [asset] });
+
+		// exists() throws -> assetExists swallows -> treated as not existing -> write.
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg,
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result.writtenAssets).toEqual(["scripts/run.js"]);
+	});
+
+	it("returns empty result arrays for an empty package", async () => {
+		const { app } = createFakeApp();
+		const result = await applyPackageImport({
+			app,
+			existingChoices: [],
+			pkg: makePackage(),
+			choiceDecisions: [],
+			assetDecisions: [],
+		});
+
+		expect(result).toEqual({
+			updatedChoices: [],
+			addedChoiceIds: [],
+			overwrittenChoiceIds: [],
+			skippedChoiceIds: [],
+			writtenAssets: [],
+			skippedAssets: [],
+		});
+	});
+});

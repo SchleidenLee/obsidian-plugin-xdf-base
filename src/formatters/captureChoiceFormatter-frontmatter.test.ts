@@ -1,0 +1,1004 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { App, TFile } from 'obsidian';
+import type ICaptureChoice from '../types/choices/ICaptureChoice';
+
+vi.mock('../utilityObsidian', () => ({
+  templaterParseTemplate: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../gui/InputPrompt', () => ({
+  __esModule: true,
+  default: class {
+    factory() {
+      return {
+        Prompt: vi.fn().mockResolvedValue(''),
+      } as any;
+    }
+  },
+}));
+
+vi.mock('../gui/InputSuggester/inputSuggester', () => ({
+  __esModule: true,
+  default: class {
+    constructor() {}
+  },
+}));
+
+vi.mock('../gui/GenericSuggester/genericSuggester', () => ({
+  __esModule: true,
+  default: {
+    Suggest: vi.fn().mockResolvedValue(''),
+  },
+}));
+
+vi.mock('../gui/VDateInputPrompt/VDateInputPrompt', () => ({
+  __esModule: true,
+  default: {
+    Prompt: vi.fn().mockResolvedValue(''),
+  },
+}));
+
+vi.mock('../utils/errorUtils', () => ({
+  __esModule: true,
+  reportError: vi.fn(),
+}));
+
+vi.mock('../gui/MathModal', () => ({
+  __esModule: true,
+  MathModal: {
+    Prompt: vi.fn().mockResolvedValue(''),
+  },
+}));
+
+vi.mock('../engine/SingleInlineScriptEngine', () => ({
+  __esModule: true,
+  SingleInlineScriptEngine: class {
+    public params = { variables: {} as Record<string, unknown> };
+    constructor() {}
+    async runAndGetOutput() {
+      return '';
+    }
+  },
+}));
+
+vi.mock('../engine/SingleMacroEngine', () => ({
+  __esModule: true,
+  SingleMacroEngine: class {
+    constructor() {}
+    async runAndGetOutput() {
+      return '';
+    }
+  },
+}));
+
+vi.mock('../engine/SingleTemplateEngine', () => ({
+  __esModule: true,
+  SingleTemplateEngine: class {
+    constructor() {}
+    async run() {
+      return '';
+    }
+    getAndClearTemplatePropertyVars() {
+      return new Map();
+    }
+    setLinkToCurrentFileBehavior() {}
+  },
+}));
+
+vi.mock('obsidian-dataview', () => ({
+  __esModule: true,
+  getAPI: vi.fn().mockReturnValue(null),
+}));
+
+vi.mock('../main', () => ({
+  __esModule: true,
+  default: class QuickAdd {
+    static instance = {
+      settings: { inputPrompt: 'single-line' },
+      app: { workspace: { getActiveViewOfType: vi.fn().mockReturnValue(null) } },
+    };
+    settings = QuickAdd.instance.settings;
+    app = QuickAdd.instance.app;
+  },
+}));
+
+import { CaptureChoiceFormatter } from './captureChoiceFormatter';
+
+const createChoice = (overrides: Partial<ICaptureChoice> = {}): ICaptureChoice => ({
+  id: 'test',
+  name: 'Test Choice',
+  type: 'Capture',
+  command: false,
+  captureTo: '',
+  captureToActiveFile: true,
+  createFileIfItDoesntExist: { enabled: false, createWithTemplate: false, template: '' },
+  format: { enabled: false, format: '' },
+  prepend: false,
+  appendLink: false,
+  task: false,
+  insertAfter: { enabled: false, after: '', insertAtEnd: false, considerSubsections: false, createIfNotFound: false, createIfNotFoundLocation: '', inline: false, replaceExisting: false, blankLineAfterMatchMode: 'auto' },
+  newLineCapture: { enabled: false, direction: 'below' },
+  openFile: false,
+  fileOpening: { location: 'tab', direction: 'vertical', mode: 'default', focus: true },
+  ...overrides,
+});
+
+const createMockApp = (): App => ({
+  workspace: {
+    getActiveFile: vi.fn().mockReturnValue(null),
+    getActiveViewOfType: vi.fn().mockReturnValue(null),
+  },
+  metadataCache: {
+    getFileCache: vi.fn().mockReturnValue(null),
+  },
+  fileManager: {
+    generateMarkdownLink: vi.fn().mockReturnValue(''),
+    processFrontMatter: vi.fn(),
+  },
+  vault: {
+    adapter: { exists: vi.fn() },
+    cachedRead: vi.fn(),
+  },
+} as unknown as App);
+
+const createTFile = (path: string): TFile => {
+  const name = path.split('/').pop() ?? path;
+  return {
+    path,
+    name,
+    basename: name.replace(/\.(md|canvas)$/i, ''),
+    extension: path.endsWith('.md') ? 'md' : 'canvas',
+  } as unknown as TFile;
+};
+
+describe('CaptureChoiceFormatter frontmatter handling', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // Provide navigator clipboard shim for formatter fallback paths
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  it('inserts capture content below frontmatter when metadata cache is empty', async () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    const formatter = new CaptureChoiceFormatter(app, plugin);
+
+    const choice = createChoice();
+    const file = createTFile('New Note.md');
+    const templateContent = ['---', 'tags: ["a"]', '---', '# Template Body'].join('\n');
+
+    const result = await formatter.formatContentWithFile('Captured line\n', choice, templateContent, file);
+
+    expect(result).toBe(['---', 'tags: ["a"]', '---', 'Captured line', '# Template Body'].join('\n'));
+  });
+});
+
+describe('CaptureChoiceFormatter insert after blank lines', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  const createFormatter = () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    const formatter = new CaptureChoiceFormatter(app, plugin);
+    const file = createTFile('Test.md');
+
+    return { formatter, file };
+  };
+
+  const createInsertAfterChoice = (
+    after: string,
+    blankLineAfterMatchMode?: 'auto' | 'skip' | 'none',
+  ): ICaptureChoice =>
+    createChoice({
+      insertAfter: {
+        enabled: true,
+        after,
+        insertAtEnd: false,
+        considerSubsections: false,
+        createIfNotFound: false,
+        createIfNotFoundLocation: '',
+        blankLineAfterMatchMode,
+      },
+    });
+
+  it('auto mode skips one blank line after a heading match', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = ['# H', '', 'A'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['# H', '', 'X', 'A'].join('\n'));
+  });
+
+  it('auto mode skips multiple blank lines after a heading match', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = ['# H', '', '', 'A'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['# H', '', '', 'X', 'A'].join('\n'));
+  });
+
+  it('auto mode treats whitespace-only lines as blank', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = ['# H', '   \t', 'A'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['# H', '   \t', 'X', 'A'].join('\n'));
+  });
+
+  it('auto mode keeps behavior unchanged when no blank lines follow', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = ['# H', 'A'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['# H', 'X', 'A'].join('\n'));
+  });
+
+  it('auto mode keeps behavior unchanged when match is at EOF', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = '# H';
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('# H\nX\n');
+  });
+
+  it('auto mode handles CRLF content when skipping blank lines', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const fileContent = '# H\r\n\r\nA';
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('# H\r\n\r\nX\nA');
+  });
+
+  it('auto mode does not skip blanks for non-heading matches', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('- Item 1');
+    const fileContent = ['- Item 1', '', '- Item 2'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['- Item 1', 'X', '', '- Item 2'].join('\n'));
+  });
+
+  it('always skip mode skips blank lines after non-heading matches', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('- Item 1', 'skip');
+    const fileContent = ['- Item 1', '', '- Item 2'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['- Item 1', '', 'X', '- Item 2'].join('\n'));
+  });
+
+  it('never skip mode inserts immediately after the match', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H', 'none');
+    const fileContent = ['# H', '', 'A'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['# H', 'X', '', 'A'].join('\n'));
+  });
+});
+
+describe('CaptureChoiceFormatter insert after end-of-section spacing', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  const createFormatter = () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    const formatter = new CaptureChoiceFormatter(app, plugin);
+    const file = createTFile('EndOfSection.md');
+
+    return { app, formatter, file };
+  };
+
+  const createInsertAfterChoice = (
+    after: string,
+    overrides: Partial<ICaptureChoice['insertAfter']> = {},
+  ): ICaptureChoice =>
+    createChoice({
+      insertAfter: {
+        enabled: true,
+        after,
+        insertAtEnd: true,
+        considerSubsections: false,
+        createIfNotFound: false,
+        createIfNotFoundLocation: '',
+        inline: false,
+        replaceExisting: false,
+        blankLineAfterMatchMode: 'auto',
+        ...overrides,
+      },
+    });
+
+  it('preserves trailing format spacing across repeated insert-at-end captures at EOF', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Journal');
+    const initial = ['# Journal', '', '10:00', 'Some data', ''].join('\n');
+
+    const first = await formatter.formatContentWithFile(
+      '18:11\nTest\n\n',
+      choice,
+      initial,
+      file,
+    );
+
+    const second = await formatter.formatContentWithFile(
+      '18:12\nTest2\n\n',
+      choice,
+      first,
+      file,
+    );
+
+    expect(second).toBe(
+      ['# Journal', '', '10:00', 'Some data', '18:11', 'Test', '', '18:12', 'Test2', '', ''].join('\n'),
+    );
+  });
+
+  it('keeps expected spacing for leading-newline capture formats', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Journal');
+    const initial = ['# Journal', '', '10:00', 'Some data', ''].join('\n');
+
+    const first = await formatter.formatContentWithFile(
+      '\n18:11\nTest3',
+      choice,
+      initial,
+      file,
+    );
+
+    const second = await formatter.formatContentWithFile(
+      '\n18:12\nTest4',
+      choice,
+      first,
+      file,
+    );
+
+    expect(second).toBe(
+      ['# Journal', '', '10:00', 'Some data', '', '18:11', 'Test3', '', '18:12', 'Test4'].join('\n'),
+    );
+  });
+
+  it('preserves spacing for non-heading insert-at-end targets at EOF', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('Target');
+    const initial = ['Target', 'Existing', ''].join('\n');
+
+    const first = await formatter.formatContentWithFile(
+      'One\n\n',
+      choice,
+      initial,
+      file,
+    );
+
+    const second = await formatter.formatContentWithFile(
+      'Two\n\n',
+      choice,
+      first,
+      file,
+    );
+
+    expect(second).toBe(['Target', 'Existing', 'One', '', 'Two', '', ''].join('\n'));
+  });
+
+  it('preserves insertion order when format has no trailing newline and EOF blanks exist', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# H');
+    const initial = ['# H', 'A', '', ''].join('\n');
+
+    const first = await formatter.formatContentWithFile(
+      'X',
+      choice,
+      initial,
+      file,
+    );
+
+    const second = await formatter.formatContentWithFile(
+      'Y',
+      choice,
+      first,
+      file,
+    );
+
+    expect(second).toBe(['# H', 'A', 'X', 'Y'].join('\n'));
+  });
+
+  it('does not change behavior when insert-at-end is disabled', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Journal', { insertAtEnd: false });
+    const initial = ['# Journal', '', '10:00', 'Some data', ''].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      '18:13\nTest5\n\n',
+      choice,
+      initial,
+      file,
+    );
+
+    expect(result).toBe(
+      ['# Journal', '', '18:13', 'Test5', '', '10:00', 'Some data', ''].join('\n'),
+    );
+  });
+
+  it('uses EOF spacing logic when create-if-not-found inserts at cursor with insert-at-end', async () => {
+    const { app, formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Missing', {
+      createIfNotFound: true,
+      createIfNotFoundLocation: 'cursor',
+    });
+    (app.workspace.getActiveViewOfType as any).mockReturnValue({
+      editor: {
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        getSelection: vi.fn().mockReturnValue(''),
+      },
+    });
+    const initial = ['# Journal', '', '10:00', 'Some data', '', ''].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      '18:14\nTest6\n\n',
+      choice,
+      initial,
+      file,
+    );
+
+    expect(result).toBe(
+      ['# Journal', '', '10:00', 'Some data', '', '# Missing', '18:14', 'Test6', '', ''].join('\n'),
+    );
+  });
+
+  it('aborts when insert-after target is missing and create-if-not-found is disabled', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Missing', {
+      createIfNotFound: false,
+    });
+    const initial = ['# Journal', '', '10:00', 'Some data', ''].join('\n');
+
+    await expect(
+      formatter.formatContentWithFile(
+        '18:15\nTest7\n\n',
+        choice,
+        initial,
+        file,
+      ),
+    ).rejects.toThrow(
+      "Insert-after target not found: '# Missing'.",
+    );
+  });
+
+  it('aborts when create-if-not-found cursor fallback has no active markdown view', async () => {
+    const { app, formatter, file } = createFormatter();
+    const choice = createInsertAfterChoice('# Missing', {
+      createIfNotFound: true,
+      createIfNotFoundLocation: 'cursor',
+      insertAtEnd: false,
+    });
+    (app.workspace.getActiveViewOfType as any).mockReturnValue(null);
+    const initial = ['# Journal', '10:00', 'Some data'].join('\n');
+
+    await expect(
+      formatter.formatContentWithFile(
+        '18:16\nTest8\n\n',
+        choice,
+        initial,
+        file,
+      ),
+    ).rejects.toThrow(
+      "Unable to insert line '# Missing' at cursor position: no active markdown editor.",
+    );
+  });
+});
+
+describe('CaptureChoiceFormatter insert after inline', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  const createFormatter = () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    const formatter = new CaptureChoiceFormatter(app, plugin);
+    const file = createTFile('Inline.md');
+
+    return { formatter, file };
+  };
+
+  const createInlineChoice = (
+    after: string,
+    overrides: Partial<ICaptureChoice['insertAfter']> = {},
+  ): ICaptureChoice =>
+    createChoice({
+      insertAfter: {
+        enabled: true,
+        after,
+        insertAtEnd: false,
+        considerSubsections: false,
+        createIfNotFound: false,
+        createIfNotFoundLocation: 'top',
+        inline: true,
+        replaceExisting: false,
+        blankLineAfterMatchMode: 'auto',
+        ...overrides,
+      },
+    });
+
+  it('inserts inline at match end and preserves suffix', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Status:', { replaceExisting: false });
+    const fileContent = 'Status: pending';
+
+    const result = await formatter.formatContentWithFile(
+      ' done',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('Status: done pending');
+  });
+
+  it('replaces to end-of-line when enabled, preserving newline', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Status: ', { replaceExisting: true });
+    const fileContent = ['Status: pending', 'Next'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'done',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['Status: done', 'Next'].join('\n'));
+  });
+
+  it('replace mode behaves like append when target is at end-of-line', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('pending', { replaceExisting: true });
+    const fileContent = 'Status: pending';
+
+    const result = await formatter.formatContentWithFile(
+      '!',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('Status: pending!');
+  });
+
+  it('creates a single inline line when target is not found', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Status: ', {
+      createIfNotFound: true,
+      createIfNotFoundLocation: 'top',
+    });
+    const fileContent = '# Header';
+
+    const result = await formatter.formatContentWithFile(
+      'done',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['Status: done', '# Header'].join('\n'));
+  });
+
+  it('aborts when inline target is missing and create-if-not-found is off', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Missing: ', { createIfNotFound: false });
+    const fileContent = 'Status: pending';
+
+    await expect(
+      formatter.formatContentWithFile(
+        'done',
+        choice,
+        fileContent,
+        file,
+      ),
+    ).rejects.toThrow(
+      "Inline insert-after target not found: 'Missing: '.",
+    );
+  });
+
+  it('updates only the first match', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Tag: ', { replaceExisting: true });
+    const fileContent = ['Tag: a', 'Tag: b'].join('\n');
+
+    const result = await formatter.formatContentWithFile(
+      'X',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe(['Tag: X', 'Tag: b'].join('\n'));
+  });
+
+  it('works with capture to active file enabled', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Status: ', { replaceExisting: true });
+    choice.captureToActiveFile = true;
+    const fileContent = 'Status: pending';
+
+    const result = await formatter.formatContentWithFile(
+      'done',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('Status: done');
+  });
+
+  it('aborts with a clear message when the inline target contains a newline (must be single-line, issue #468)', async () => {
+    const { formatter, file } = createFormatter();
+    const choice = createInlineChoice('Status:\n', { replaceExisting: true });
+    const fileContent = 'Status:\npending';
+
+    await expect(
+      formatter.formatContentWithFile('done', choice, fileContent, file),
+    ).rejects.toThrow(/single line/i);
+  });
+});
+
+describe('CaptureChoiceFormatter append task newline regression (issue #124)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  it('inserts a newline before an appended task when the file does not end with a newline', async () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    const formatter = new CaptureChoiceFormatter(app, plugin);
+
+    const choice = createChoice({ prepend: true, task: true });
+    const file = createTFile('Test.md');
+    const fileContent = '- [ ] Old task';
+
+    const result = await formatter.formatContentWithFile(
+      '- [ ] New task\n',
+      choice,
+      fileContent,
+      file,
+    );
+
+    expect(result).toBe('- [ ] Old task\n- [ ] New task\n');
+  });
+});
+
+describe('CaptureChoiceFormatter #647 frontmatter-aware top insertion', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    (global as any).navigator = {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(''),
+      },
+    };
+  });
+
+  const makeFormatter = () => {
+    const app = createMockApp();
+    const plugin = {
+      settings: {
+        enableTemplatePropertyTypes: false,
+        globalVariables: {},
+        showCaptureNotification: false,
+        showInputCancellationNotification: true,
+      },
+    } as any;
+    return new CaptureChoiceFormatter(app, plugin);
+  };
+
+  // Capture payload with NO trailing newline — the common single-line format case
+  // that previously glued onto the first body line / above the frontmatter.
+  const topInsert = (content: string, payload = 'INSERTED') =>
+    makeFormatter().formatContentWithFile(
+      payload,
+      createChoice({ captureToActiveFile: false }),
+      content,
+      createTFile('Note.md'),
+    );
+
+  it('inserts BELOW empty frontmatter instead of above it (the literal #647 bug)', async () => {
+    expect(await topInsert('---\n---\n# Body')).toBe('---\n---\nINSERTED\n# Body');
+  });
+
+  it('separates the capture from an immediately-following body line (no glue)', async () => {
+    expect(await topInsert('---\ntitle: A\n---\n# Heading')).toBe(
+      '---\ntitle: A\n---\nINSERTED\n# Heading',
+    );
+  });
+
+  it('inserts at the very top when there is no frontmatter, on its own line', async () => {
+    expect(await topInsert('# Heading\nBody')).toBe('INSERTED\n# Heading\nBody');
+  });
+
+  it('keeps the closing fence intact for an empty frontmatter-only note (no trailing newline)', async () => {
+    expect(await topInsert('---\n---')).toBe('---\n---\nINSERTED');
+  });
+
+  it('keeps the closing fence intact for a frontmatter-only note with no trailing newline', async () => {
+    expect(await topInsert('---\ntitle: A\n---')).toBe('---\ntitle: A\n---\nINSERTED');
+  });
+
+  it('preserves CRLF frontmatter and inserts after the closing fence', async () => {
+    expect(await topInsert('---\r\ntitle: A\r\n---\r\n# Body\r\n')).toBe(
+      '---\r\ntitle: A\r\n---\r\nINSERTED\n# Body\r\n',
+    );
+  });
+
+  it('keeps the blank line separating frontmatter from the body (issue #1538)', async () => {
+    expect(await topInsert('---\ndate: 2026-07-25\n---\n\n## Log\n\n## Tasks\n')).toBe(
+      '---\ndate: 2026-07-25\n---\n\nINSERTED\n## Log\n\n## Tasks\n',
+    );
+  });
+
+  it('keeps an existing CRLF separator line after the fence (issue #1538)', async () => {
+    expect(await topInsert('---\r\ntitle: A\r\n---\r\n\r\nBody')).toBe(
+      '---\r\ntitle: A\r\n---\r\n\r\nINSERTED\nBody',
+    );
+  });
+
+  it('treats a "..."-closed block as no frontmatter (Obsidian-consistent) and inserts at top', async () => {
+    expect(await topInsert('---\ntitle: A\n...\n# Body')).toBe(
+      'INSERTED\n---\ntitle: A\n...\n# Body',
+    );
+  });
+
+  it('treats a leading-blank-line fence as no frontmatter (Obsidian-consistent) and inserts at absolute top', async () => {
+    // exists:false (fence not at offset 0) -> capture lands at the very top. The
+    // note's leading blank line is kept: consuming it would move the fence to
+    // offset 0 territory and silently reshape the note (issue #1538).
+    expect(await topInsert('\n---\ntitle: A\n---\n# Body')).toBe(
+      'INSERTED\n\n---\ntitle: A\n---\n# Body',
+    );
+  });
+
+  it('does not add a double newline when the capture already ends with one (task payload) into frontmatter-only note', async () => {
+    const result = await makeFormatter().formatContentWithFile(
+      '- [ ] TASK\n',
+      createChoice({ captureToActiveFile: false, task: true }),
+      '---\n---',
+      createTFile('Note.md'),
+    );
+    expect(result).toBe('---\n---\n- [ ] TASK\n');
+  });
+
+  it('separates a task create-if-not-found-at-top from the body (previously glued)', async () => {
+    const result = await makeFormatter().formatContentWithFile(
+      '- [ ] CAP',
+      createChoice({
+        task: true,
+        insertAfter: {
+          enabled: true,
+          after: '## Missing',
+          insertAtEnd: false,
+          considerSubsections: false,
+          createIfNotFound: true,
+          createIfNotFoundLocation: 'top',
+          inline: false,
+          replaceExisting: false,
+          blankLineAfterMatchMode: 'auto',
+        },
+      }),
+      '# Header',
+      createTFile('Note.md'),
+    );
+    expect(result).toBe('## Missing\n- [ ] CAP\n# Header');
+  });
+
+  // Every "create the missing target at the top" path routes through the same
+  // frontmatter-aware primitive. Without a note that HAS a separator line, each of
+  // these could silently revert to the #1538 behaviour with the suite still green.
+  describe('create-if-not-found at top, into a note with a separator line', () => {
+    const NOTE = '---\ndate: 2026-07-25\n---\n\n## Log\n';
+    const insertAfterTarget = (overrides: Record<string, unknown> = {}) => ({
+      enabled: true,
+      after: '## Missing',
+      insertAtEnd: false,
+      considerSubsections: false,
+      createIfNotFound: true,
+      createIfNotFoundLocation: 'top',
+      inline: false,
+      replaceExisting: false,
+      blankLineAfterMatchMode: 'auto',
+      ...overrides,
+    });
+
+    it('creates a missing insert-after section below the separator line', async () => {
+      const result = await makeFormatter().formatContentWithFile(
+        '- entry',
+        createChoice({
+          captureToActiveFile: false,
+          insertAfter: insertAfterTarget() as any,
+        }),
+        NOTE,
+        createTFile('Note.md'),
+      );
+      expect(result).toBe(
+        '---\ndate: 2026-07-25\n---\n\n## Missing\n- entry\n## Log\n',
+      );
+    });
+
+    it('creates a missing INLINE insert-after target below the separator line', async () => {
+      const result = await makeFormatter().formatContentWithFile(
+        'Status: done',
+        createChoice({
+          captureToActiveFile: false,
+          insertAfter: insertAfterTarget({ after: 'MISSING', inline: true }) as any,
+        }),
+        NOTE,
+        createTFile('Note.md'),
+      );
+      expect(result).toBe(
+        '---\ndate: 2026-07-25\n---\n\nMISSINGStatus: done\n## Log\n',
+      );
+    });
+
+    it('degrades an ordered create with a non-heading anchor to below the separator line', async () => {
+      const result = await makeFormatter().formatContentWithFile(
+        '- entry\n',
+        createChoice({
+          captureToActiveFile: false,
+          insertAfter: insertAfterTarget({
+            after: 'Some anchor',
+            orderBy: { by: 'insertion', direction: 'desc', unparseable: 'bottom' },
+          }) as any,
+        }),
+        NOTE,
+        createTFile('Note.md'),
+      );
+      expect(result).toBe(
+        '---\ndate: 2026-07-25\n---\n\nSome anchor\n- entry\n## Log\n',
+      );
+    });
+
+    it('creates a missing insert-before target below the separator line and tracks the cursor', async () => {
+      const formatter = makeFormatter();
+      const result = await formatter.formatContentWithFile(
+        '- entry',
+        createChoice({
+          captureToActiveFile: false,
+          insertBefore: {
+            enabled: true,
+            before: '## Missing',
+            createIfNotFound: true,
+            createIfNotFoundLocation: 'top',
+          },
+        }),
+        NOTE,
+        createTFile('Note.md'),
+      );
+      expect(result).toBe(
+        '---\ndate: 2026-07-25\n---\n\n- entry\n## Missing\n## Log\n',
+      );
+      // This is the only caller passing a non-default cursorOffsetInText: the cursor
+      // must land at the end of the capture, not at the end of the created anchor.
+      expect(formatter.getCaptureInsertionEndOffset()).toBe(
+        '---\ndate: 2026-07-25\n---\n\n- entry'.length,
+      );
+    });
+  });
+});
