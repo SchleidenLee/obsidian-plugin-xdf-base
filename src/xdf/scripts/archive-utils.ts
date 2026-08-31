@@ -642,8 +642,7 @@ async function pickStartingDate() {
 // ========== 模板 ==========
 
 function buildPersonFeedback(opts) {
-    const homeworkLabel = buildHomeworkLabel(opts.lessonNumber, opts.subject);
-    return [
+    const lines = [
         "## 👤 " + opts.name,
         "",
         "",
@@ -651,11 +650,19 @@ function buildPersonFeedback(opts) {
         "#### 出勤",
         opts.month + "月" + opts.day + "日出勤情况：<input type=\"checkbox\" checked> 正常 <input type=\"checkbox\"> 迟到 <input type=\"checkbox\"> 早退 <input type=\"checkbox\"> 线上课 <input type=\"checkbox\"> 请假",
         "",
-        "",
-        "#### 作业情况",
-        homeworkLabel + "：<input type=\"checkbox\"> 已完成 <input type=\"checkbox\"> 未完成",
-        "",
-        "",
+        ""
+    ];
+    // 作业情况写上一课布置的作业（本课讲评的那份）；第 1 课没有上一课作业，不生成
+    if (opts.lessonNumber > 1) {
+        const homeworkLabel = buildHomeworkLabel(opts.lessonNumber - 1, opts.subject);
+        lines.push(
+            "#### 作业情况",
+            homeworkLabel + "：<input type=\"checkbox\"> 已完成 <input type=\"checkbox\"> 未完成",
+            "",
+            ""
+        );
+    }
+    lines.push(
         "#### 入门测情况",
         "",
         "",
@@ -674,7 +681,8 @@ function buildPersonFeedback(opts) {
         "",
         "<!-- AI_GENERATED_END -->",
         ""
-    ].join("\n");
+    );
+    return lines.join("\n");
 }
 
 function buildClassFeedback(students, opts) {

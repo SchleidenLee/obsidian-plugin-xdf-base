@@ -12,9 +12,11 @@
  */
 
 import type { App, Plugin } from "obsidian";
-import { Notice } from "obsidian";
+import { Notice, TFile } from "obsidian";
 import { DBConnection, DBSync, createDBApi, type XdfDBApi } from "./db";
-import { DBBuilder } from "./db/Builder";
+import { rebuildDatabase as rebuildVaultDatabase, DBWriter } from "./db/Builder";
+import { SchemaManager } from "./db/Schema";
+import { appendDbLog } from "./db/DbLog";
 import { ScriptReleaser } from "./scripts/ScriptReleaser";
 import { syncPresetChoices } from "./choiceManager";
 
@@ -71,22 +73,100 @@ export class XdfBaseExtension {
             console.error("[XDF-Base] Choice 同步失败:", err);
         }
 
-        // 3. 启动 vault 事件监听
+        // 3. 初始化数据库（建表 + 空库全量重建 / 旧库对账补漏）
+        //    必须在 sync.attach() 之前完成：避免监听器打到未初始化的连接
+        try {
+            await this.db.initialize();
+            new SchemaManager(this.db).apply();
+            this.registerDBApi();
+            await this.reconcileOnStartup();
+            console.log("[XDF-Base] 数据库已初始化");
+        } catch (err) {
+            console.error("[XDF-Base] 数据库初始化失败:", err);
+            new Notice("⚠️ XDF-Base 数据库暂不可用：" + err);
+            void appendDbLog(this.app, {
+                level: "error",
+                source: "DB启动",
+                message: `数据库初始化失败：${String(err)}`,
+            });
+        }
+
+        // 4. 启动 vault 事件监听（数据库就绪后才挂）
         try {
             this.sync.attach();
             console.log("[XDF-Base] 事件监听已启动");
         } catch (err) {
             console.error("[XDF-Base] 事件监听启动失败:", err);
         }
+    }
 
-        // 4. 初始化数据库（失败不影响上述功能）
-        try {
-            await this.db.initialize();
-            this.registerDBApi();
-            console.log("[XDF-Base] 数据库已初始化");
-        } catch (err) {
-            console.error("[XDF-Base] 数据库初始化失败:", err);
-            new Notice("⚠️ XDF-Base 数据库暂不可用：" + err);
+    /**
+     * 启动对账（设计稿同步机制第 2 条）：
+     * - 空库（files 表为空且 vault 有 md）→ 全量重建
+     * - vault 有而库无 / mtime 不一致 → 逐文件补 upsert（事件丢失兜底）
+     * - 库有而 vault 无 → 按路径删除（文件在外部被移走）
+     */
+    private async reconcileOnStartup(): Promise<void> {
+        const files = this.app.vault.getFiles()
+            .filter(f => !f.path.split("/").some(seg => [".obsidian", ".trash", ".xdf"].includes(seg)))
+            .filter(f => !["tmp", "log", "crdownload", "part"].includes(f.extension.toLowerCase()));
+        const knownRows = this.db.query<{ path: string; mtime: number }>(
+            "SELECT path, mtime FROM files"
+        );
+        const known = new Map(knownRows.map(r => [r.path, r.mtime]));
+
+        // 库有 vault 无 → 删
+        const vaultPaths = new Set(files.map(f => f.path));
+        for (const row of knownRows) {
+            if (!vaultPaths.has(row.path)) {
+                new DBWriter(this.db).removeFile(row.path);
+            }
+        }
+
+        // vault 有库无 / mtime 变 → 补（md 读内容，非 md 登记为 binary）
+        const stale: TFile[] = [];
+        for (const f of files) {
+            const recorded = known.get(f.path);
+            if (recorded == null || recorded !== Math.floor(f.stat.mtime / 1000)) {
+                stale.push(f);
+            }
+        }
+
+        if (knownRows.length === 0 && files.length > 0) {
+            // 空库 → 全量重建（含 frontmatter 解析、实体、切块、binary 登记）
+            const stats = await rebuildVaultDatabase(this.app, this.db);
+            await this.db.save();
+            console.log(`[XDF-Base] 空库全量重建完成：${stats.fileCount} 文件，错误 ${stats.errors.length}`);
+            for (const e of stats.errors) {
+                void appendDbLog(this.app, {
+                    level: "warn", source: "DB重建",
+                    message: e.message, path: e.path,
+                });
+            }
+            return;
+        }
+
+        if (stale.length > 0 || knownRows.length > vaultPaths.size) {
+            const writer = new DBWriter(this.db);
+            for (const f of stale) {
+                const isMd = f.extension === "md";
+                const stats = writer.upsertFile({
+                    path: f.path,
+                    basename: f.basename,
+                    content: isMd ? await this.app.vault.cachedRead(f) : "",
+                    mtime: Math.floor(f.stat.mtime / 1000),
+                    size: f.stat.size,
+                    binary: !isMd,
+                });
+                for (const e of stats.errors) {
+                    void appendDbLog(this.app, {
+                        level: "warn", source: "DB对账",
+                        message: e.message, path: e.path,
+                    });
+                }
+            }
+            await this.db.save();
+            console.log(`[XDF-Base] 启动对账完成：补写 ${stale.length} 个文件`);
         }
     }
 
@@ -115,6 +195,8 @@ export class XdfBaseExtension {
      */
     async initDatabase(): Promise<void> {
         await this.db.initialize();
+        // 建表 + 开外键（幂等；clear() 重建后同样要重跑）
+        new SchemaManager(this.db).apply();
     }
 
     /**
@@ -122,13 +204,13 @@ export class XdfBaseExtension {
      * 返回真实数据：扫描文件数、耗时、错误列表
      */
     async rebuildDatabase(): Promise<RebuildSummary> {
-        const builder = new DBBuilder(this.app, this.db);
-        const report = await builder.rebuild();
+        const started = Date.now();
+        const stats = await rebuildVaultDatabase(this.app, this.db);
         await this.db.save();
         return {
-            fileCount: report.fileCount,
-            durationMs: report.durationMs,
-            errors: report.errors
+            fileCount: stats.fileCount,
+            durationMs: Date.now() - started,
+            errors: stats.errors.map(e => ({ file: e.path, message: e.message }))
         };
     }
 

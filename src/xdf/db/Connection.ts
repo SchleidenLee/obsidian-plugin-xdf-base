@@ -69,15 +69,19 @@ export class DBConnection {
         if (!SQL) {
             throw new Error("sql.js 初始化失败");
         }
+        let existed = true;
         if (await adapter.exists(this.dbPath)) {
             const buffer = await adapter.readBinary(this.dbPath);
             this.database = new SQL.Database(new Uint8Array(buffer));
         } else {
+            existed = false;
             this.database = new SQL.Database();
+        }
+        // 先置标志再 save：save() 内部有 ensureOpen 校验
+        this.initialized = true;
+        if (!existed) {
             await this.save();
         }
-
-        this.initialized = true;
     }
 
     /**
@@ -170,9 +174,20 @@ export class DBConnection {
 
     /**
      * 获取数据库状态信息
+     *
+     * 未初始化时返回 isOpen:false 而不是抛错——
+     * 设置面板会在启动初始化完成前调用这里（异步初始化窗口期）。
      */
     getStatus(): DBStatus {
-        this.ensureOpen();
+        if (!this.initialized || !this.database) {
+            return {
+                path: this.dbPath,
+                isOpen: false,
+                isDirty: false,
+                tableCount: 0,
+                tables: []
+            };
+        }
         let tables: string[] = [];
         let tableCount = 0;
         try {

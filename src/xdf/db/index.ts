@@ -10,7 +10,7 @@
 
 import type { App } from "obsidian";
 import { DBConnection } from "./Connection";
-import { DBBuilder } from "./Builder";
+import { rebuildDatabase, DBWriter, collectVaultFiles } from "./Builder";
 import { DBSync } from "./Sync";
 
 export interface XdfDBApi {
@@ -38,18 +38,17 @@ export interface XdfDBApi {
  * 创建暴露给脚本的 db API
  */
 export function createDBApi(app: App, db: DBConnection, sync: DBSync): XdfDBApi {
-    const builder = new DBBuilder(app, db);
-
     return {
         exec: (sql, params) => db.exec(sql, params),
         query: (sql, params) => db.query(sql, params),
         rebuild: async () => {
-            const report = await builder.rebuild();
+            const started = Date.now();
+            const stats = await rebuildDatabase(app, db);
             await db.save();
             return {
-                fileCount: report.fileCount,
-                durationMs: report.durationMs,
-                errors: report.errors
+                fileCount: stats.fileCount,
+                durationMs: Date.now() - started,
+                errors: stats.errors
             };
         },
         status: () => db.getStatus(),
@@ -58,4 +57,4 @@ export function createDBApi(app: App, db: DBConnection, sync: DBSync): XdfDBApi 
     };
 }
 
-export { DBConnection, DBBuilder, DBSync };
+export { DBConnection, DBSync, DBWriter, collectVaultFiles, rebuildDatabase };

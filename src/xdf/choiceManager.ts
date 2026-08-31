@@ -2,12 +2,13 @@
  * Choice 预设管理（分组版）
  *
  * 预设 Choice 以「文件夹（Multi Choice）」形式写入 data.json：
- *   档案工具函数库 / 档案管理 / 文件生成
+ *   档案管理 / 文件生成
  *
  * 每次启动同步（与脚本释放同一覆盖语义）：
  * - 预设文件夹 id 已存在 → 原位重建 children
  * - 存在用户手动建的同名 Multi（旧布局）→ 接管（换成预设 id + 重建 children，保留折叠状态和位置）
  * - 散落的预设单 choice（更旧的扁平布局）→ 移除（内容由文件夹重建）
+ * - 已退役的预设文件夹（见 RETIRED_FOLDER_IDS）→ 移除
  * - 用户自己创建的 Choice → 完全不动
  */
 
@@ -24,11 +25,6 @@ interface PresetFolder {
 
 export const PRESET_FOLDERS: PresetFolder[] = [
     {
-        id: "xdf-base-folder-utils",
-        name: "档案工具函数库",
-        scriptIds: ["archive-utils"]
-    },
-    {
         id: "xdf-base-folder-archive",
         name: "档案管理",
         scriptIds: [
@@ -44,6 +40,13 @@ export const PRESET_FOLDERS: PresetFolder[] = [
         scriptIds: ["wordlist-ai", "homework-ai"]
     }
 ];
+
+/**
+ * 已退役的预设文件夹 id（不再生成，启动同步时从 data.json 移除）。
+ * - xdf-base-folder-utils：ArchiveUtils 是被其他脚本加载的工具库，
+ *   文件照常释放到 utils/，但不该作为可运行 Choice 出现在菜单里。
+ */
+const RETIRED_FOLDER_IDS = new Set(["xdf-base-folder-utils"]);
 
 /** 所有预设单 choice 的 id（不含文件夹） */
 const PRESET_CHOICE_IDS = new Set(
@@ -141,10 +144,15 @@ export function syncPresetChoices(currentChoices: any[] = []): {
         }
     });
 
-    // 2. 顶层未被接管位引用的散落预设脚本打墓碑（收进文件夹后统一清除）
+    // 2. 顶层未被接管位引用的散落预设脚本打墓碑（收进文件夹后统一清除）；
+    //    已退役的预设文件夹同样打墓碑移除
     const takeoverSlots = new Set(takeoverIndex.values());
     work.forEach((c, i) => {
-        if (c && PRESET_CHOICE_IDS.has(c.id) && !takeoverSlots.has(i)) {
+        if (!c) return;
+        if (
+            (PRESET_CHOICE_IDS.has(c.id) && !takeoverSlots.has(i)) ||
+            RETIRED_FOLDER_IDS.has(c.id)
+        ) {
             work[i] = null;
         }
     });
