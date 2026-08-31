@@ -1,7 +1,7 @@
 {
 	"id": "xdf-base",
 	"name": "XDF-Base",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"minAppVersion": "1.13.0",
 	"description": "XDF 教学系统核心插件：QuickAdd 脚本引擎 + AI 调用 + SQLite 数据库同步。",
 	"author": "Schleiden",

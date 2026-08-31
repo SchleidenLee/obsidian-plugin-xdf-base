@@ -32,9 +32,17 @@ XDF 教学系统核心 Obsidian 插件：在 [QuickAdd](https://github.com/chhou
 
 内置 AI（LLM）调用能力，供脚本以函数形式调用（作业生成、词表生成、反馈总结等），设置页不需要用户填写 prompt。
 
-### 5. SQLite 数据库（建设中）
+### 5. SQLite 数据库同步
 
-基于 sql.js (WASM) 的 vault 数据同步层：vault 文件变更实时监听（debounce），数据落地到 `vault/.xdf/xdf.db`，供 MCP 工具查询。
+基于 sql.js (WASM) 的 vault 数据同步层，数据落地到 `vault/.xdf/xdf.db`（隐藏目录），供 MCP 工具与 AI 查询：
+
+- **7 表结构**：实体层（students / archives / lessons / class_roster）+ 内容层（sections / files / checkboxes）
+- **契约文件全量细粒度入库**：档案页、课次 nav、课次包 7 文件、反馈页——frontmatter 实体化、正文按 heading 切块（`👤 张三/原始记录/出勤` 级路径）、HTML checkbox 与 markdown task 双来源解析
+- **脏数据只登记路径**：契约外的 md 与非 md 附件（pdf/ppt 等）在 files 表登记路径与归属，不读内容
+- **增量同步**：文件变更 500ms debounce + 2s 节流，只重写受影响文件的行；上课连续记笔记不打扰
+- **启动自愈**：空库自动全量重建；旧库按 mtime 对账补漏（外部改动文件不丢）
+- **最终一致**：md 是唯一数据源，数据库落后最多约 2.5 秒；同步失败写入 `00.SYSTEM/Logs/ai-log.md`
+- **查询入口**：`app.plugins.plugins["xdf-base"].api.db.query(sql)`（只读推荐走 MCP 拷贝副本）
 
 ## 构建
 
