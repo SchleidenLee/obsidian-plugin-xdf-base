@@ -656,11 +656,10 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 
 	/**
 	 * 数据库面板：
-	 * - 状态查询（表格数 / 路径 / dirty 标志）
-	 * - 初始化（已经初始化了，重置 dirty 标志）
+	 * - 状态查询（表数 / 路径 / dirty 标志），键值网格展示
 	 * - 重建（清空表 + 全量重新扫描 vault）
 	 *
-	 * 状态会同步显示在按钮下方的 <pre> 块里。
+	 * 初始化已由启动链路自动完成，不再提供手动按钮。
 	 */
 	private renderDatabasePanel(setting: Setting): () => void {
 		this.prepareFullWidthSetting(setting);
@@ -668,76 +667,65 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		setting.controlEl.addClass("qa-xdf-database-control");
 
 		const container = setting.controlEl.createDiv("qa-xdf-database-panel");
-		const statusEl = container.createEl("pre", {
-			cls: "qa-xdf-database-status",
-			text: "加载中…",
-		});
-		const buttonRow = container.createDiv("qa-xdf-database-buttons");
+		const statusEl = container.createDiv("qa-xdf-status-grid");
+		statusEl.setText("加载中…");
 
 		const renderStatus = (): void => {
+			statusEl.empty();
 			const xdf = getXdfBaseInstance();
 			if (!xdf) {
 				statusEl.setText("（插件未完全初始化）");
 				return;
 			}
 			const s = xdf.getDatabaseStatus();
-			const lines = [
-				`路径:   ${s.path}`,
-				`已打开: ${s.isOpen}`,
-				`有改动: ${s.isDirty}`,
-				`表 (${s.tableCount}): ${s.tables.length ? s.tables.join(", ") : "（无）"}`,
+			const rows: Array<[string, string, boolean?]> = [
+				["数据库文件", s.path],
+				["连接状态", s.isOpen ? "已打开" : "未打开", s.isOpen],
+				["未同步改动", s.isDirty ? "有（等待写入）" : "无", !s.isDirty],
+				[
+					`数据表（${s.tableCount}）`,
+					s.tables.length ? s.tables.join("、") : "（无）",
+				],
 			];
-			statusEl.setText(lines.join("\n"));
+			for (const [label, value, ok] of rows) {
+				const row = statusEl.createDiv("qa-xdf-status-row");
+				row.createSpan({ cls: "qa-xdf-status-label", text: label });
+				const valueEl = row.createSpan({
+					cls: "qa-xdf-status-value",
+					text: value,
+				});
+				if (ok === true) valueEl.addClass("is-ok");
+				if (ok === false) valueEl.addClass("is-warn");
+			}
 		};
 
 		setting.addButton((button) => {
 			button.setButtonText("刷新状态").onClick(() => renderStatus());
 		});
-
-		buttonRow.createEl("button", {
-			cls: "qa-xdf-db-init",
-			text: "初始化数据库",
-		}).addEventListener("click", async () => {
-			const xdf = getXdfBaseInstance();
-			if (!xdf) {
-				new Notice("XDF-Base 尚未初始化");
-				return;
-			}
-			try {
-				await xdf.initDatabase();
-				new Notice("数据库已初始化");
-			} catch (err) {
-				new Notice(`初始化失败：${err}`);
-			}
-			renderStatus();
-		});
-
-		buttonRow.createEl("button", {
-			cls: "qa-xdf-db-rebuild",
-			text: "重建数据库",
-		}).addEventListener("click", async () => {
-			const xdf = getXdfBaseInstance();
-			if (!xdf) {
-				new Notice("XDF-Base 尚未初始化");
-				return;
-			}
-			buttonRow.querySelectorAll("button").forEach((b) => {
-				(b as HTMLButtonElement).disabled = true;
-			});
-			try {
-				new Notice("正在重建数据库…");
-				const report = await xdf.rebuildDatabase();
-				new Notice(
-					`重建完成 — ${report.fileCount} 个文件（${report.durationMs}ms）`,
-				);
-			} catch (err) {
-				new Notice(`重建失败：${err}`);
-			} finally {
-				buttonRow.querySelectorAll("button").forEach((b) => {
-					(b as HTMLButtonElement).disabled = false;
+		setting.addButton((button) => {
+			button
+				.setButtonText("重建数据库")
+				.setCta()
+				.onClick(async () => {
+					const xdf = getXdfBaseInstance();
+					if (!xdf) {
+						new Notice("XDF-Base 尚未初始化");
+						return;
+					}
+					button.setDisabled(true);
+					try {
+						new Notice("正在重建数据库…");
+						const report = await xdf.rebuildDatabase();
+						new Notice(
+							`重建完成 — ${report.fileCount} 个文件（${report.durationMs}ms）`,
+						);
+					} catch (err) {
+						new Notice(`重建失败：${err}`);
+					} finally {
+						button.setDisabled(false);
+						renderStatus();
+					}
 				});
-				renderStatus();
-			}
 		});
 
 		// 首次渲染状态
@@ -750,7 +738,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 
 	/**
 	 * 脚本释放面板：
-	 * - 显示当前已安装 / 缺失的预设脚本
+	 * - 显示当前已安装 / 缺失的预设脚本（列表样式，与数据库面板同风格）
 	 * - 一键重新释放（仅补全缺失，不覆盖）
 	 * - 一键补全 Choice（idempotent）
 	 */
@@ -760,88 +748,93 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 		setting.controlEl.addClass("qa-xdf-scripts-control");
 
 		const container = setting.controlEl.createDiv("qa-xdf-scripts-panel");
-		const statusEl = container.createEl("pre", {
-			cls: "qa-xdf-scripts-status",
-			text: "加载中…",
-		});
-		const buttonRow = container.createDiv("qa-xdf-scripts-buttons");
+		const statusEl = container.createDiv("qa-xdf-status-grid");
+		statusEl.setText("加载中…");
 
 		const renderStatus = async (): Promise<void> => {
+			statusEl.empty();
 			const releaser = new ScriptReleaser(this.app);
 			try {
 				const status = await releaser.getStatus();
-				const lines: string[] = [
-					`系统目录:  ${status.systemDir}`,
-					`已安装 (${status.installed.length}):`,
-					...status.installed.map((p) => `  ✓ ${p}`),
-				];
-				if (status.missing.length > 0) {
-					lines.push(
-						`缺失 (${status.missing.length}):`,
-						...status.missing.map((p) => `  ✗ ${p}`),
-					);
-				} else {
-					lines.push("缺失:（无）");
+				const dirRow = statusEl.createDiv("qa-xdf-status-row");
+				dirRow.createSpan({
+					cls: "qa-xdf-status-label",
+					text: "系统目录",
+				});
+				dirRow.createSpan({
+					cls: "qa-xdf-status-value",
+					text: status.systemDir,
+				});
+				const listRow = statusEl.createDiv("qa-xdf-status-row");
+				listRow.createSpan({
+					cls: "qa-xdf-status-label",
+					text: `预设脚本（${status.installed.length}）`,
+				});
+				const listEl = listRow.createDiv("qa-xdf-script-list");
+				for (const p of status.installed) {
+					listEl.createDiv({
+						cls: "qa-xdf-script-item is-installed",
+						text: `✓ ${p}`,
+					});
 				}
-				statusEl.setText(lines.join("\n"));
+				for (const p of status.missing) {
+					listEl.createDiv({
+						cls: "qa-xdf-script-item is-missing",
+						text: `✗ ${p}`,
+					});
+				}
 			} catch (err) {
 				statusEl.setText(`错误：${err}`);
 			}
 		};
 
-		buttonRow.createEl("button", {
-			cls: "qa-xdf-scripts-release",
-			text: "重新释放脚本",
-		}).addEventListener("click", async () => {
-			buttonRow.querySelectorAll("button").forEach((b) => {
-				(b as HTMLButtonElement).disabled = true;
-			});
-			try {
+		setting.addButton((button) => {
+			button.setButtonText("重新释放脚本").onClick(async () => {
 				const xdf = getXdfBaseInstance();
 				if (!xdf) {
 					new Notice("XDF-Base 尚未初始化");
 					return;
 				}
-				const report = await xdf.releaseScripts();
-				new Notice(
-					`释放完成：新建 ${report.created.length}，覆盖 ${report.updated.length}，失败 ${report.failed.length}`,
-				);
-			} catch (err) {
-				new Notice(`释放失败：${err}`);
-			} finally {
-				buttonRow.querySelectorAll("button").forEach((b) => {
-					(b as HTMLButtonElement).disabled = false;
-				});
-				await renderStatus();
-			}
+				button.setDisabled(true);
+				try {
+					const report = await xdf.releaseScripts();
+					new Notice(
+						`释放完成：新建 ${report.created.length}，覆盖 ${report.updated.length}，失败 ${report.failed.length}`,
+					);
+				} catch (err) {
+					new Notice(`释放失败：${err}`);
+				} finally {
+					button.setDisabled(false);
+					await renderStatus();
+				}
+			});
 		});
-
-		buttonRow.createEl("button", {
-			cls: "qa-xdf-scripts-choices",
-			text: "同步预设 Choice",
-		}).addEventListener("click", async () => {
-			buttonRow.querySelectorAll("button").forEach((b) => {
-				(b as HTMLButtonElement).disabled = true;
-			});
-			try {
-				const xdf = getXdfBaseInstance();
-				if (!xdf) {
-					new Notice("XDF-Base 尚未初始化");
-					return;
-				}
-				const result = await xdf.ensureChoices();
-				if (result.updated) {
-					new Notice(`同步完成：新增文件夹 ${result.added.length}，重建 ${result.replaced.length}`);
-				} else {
-					new Notice("所有预设文件夹已就位");
-				}
-			} catch (err) {
-				new Notice(`同步失败：${err}`);
-			} finally {
-				buttonRow.querySelectorAll("button").forEach((b) => {
-					(b as HTMLButtonElement).disabled = false;
+		setting.addButton((button) => {
+			button
+				.setButtonText("同步预设 Choice")
+				.setCta()
+				.onClick(async () => {
+					const xdf = getXdfBaseInstance();
+					if (!xdf) {
+						new Notice("XDF-Base 尚未初始化");
+						return;
+					}
+					button.setDisabled(true);
+					try {
+						const result = await xdf.ensureChoices();
+						if (result.updated) {
+							new Notice(
+								`同步完成：新增文件夹 ${result.added.length}，重建 ${result.replaced.length}`,
+							);
+						} else {
+							new Notice("所有预设文件夹已就位");
+						}
+					} catch (err) {
+						new Notice(`同步失败：${err}`);
+					} finally {
+						button.setDisabled(false);
+					}
 				});
-			}
 		});
 
 		void renderStatus();

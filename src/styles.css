@@ -15,6 +15,63 @@
 	}
 }
 
+/* XDF 数据库 / 脚本面板：与原生 Setting 风格统一 */
+.qa-xdf-status-grid {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin: 4px 0 12px;
+}
+
+.qa-xdf-status-row {
+	display: flex;
+	align-items: baseline;
+	gap: 12px;
+	min-width: 0;
+}
+
+.qa-xdf-status-label {
+	flex: 0 0 9em;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.qa-xdf-status-value {
+	color: var(--text-normal);
+	font-size: var(--font-ui-smaller);
+	font-family: var(--font-monospace);
+	overflow-wrap: anywhere;
+}
+
+.qa-xdf-status-value.is-ok {
+	color: var(--text-success, var(--color-green));
+}
+
+.qa-xdf-status-value.is-warn {
+	color: var(--text-warning, var(--color-orange));
+}
+
+.qa-xdf-script-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.qa-xdf-script-item {
+	font-size: var(--font-ui-smaller);
+	font-family: var(--font-monospace);
+	overflow-wrap: anywhere;
+}
+
+.qa-xdf-script-item.is-installed {
+	color: var(--text-success, var(--color-green));
+}
+
+.qa-xdf-script-item.is-missing {
+	color: var(--text-error, var(--color-red));
+}
+
 /* Everything else */
 @media screen and (min-width: 541px) {
 	.wideInputPromptInputEl {
