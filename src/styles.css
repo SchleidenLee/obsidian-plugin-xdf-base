@@ -2543,35 +2543,20 @@ textarea.is-valid {
         cursor: progress;
 }
 
-/* ===== Feedback 文件（契约命名 Feedback N.md）出勤/作业 task 内联并排 =====
-   作用域 = qa-xdf-feedback-inline 类（src/xdf/FeedbackInline.ts 在打开契约文件时
-   打到 .workspace-leaf-content 上，零 frontmatter）。已用 DevTools 注入实验验证
-   两种模式均可横排：
-   阅读视图：ul/li 列表 DOM，flex 换行；
-   Live Preview：task 是逐行 .cm-line.HyperMD-task-line 编辑行（每项独立块级行），
-   inline-flex 横排（限定 HyperMD-task-line，避免影响普通列表行）。 */
-.workspace-leaf-content.qa-xdf-feedback-inline ul.contains-task-list {
-	display: flex;
-	flex-wrap: wrap;
-	list-style: none;
-	padding-left: 0;
-	row-gap: 2px;
-}
-
-.workspace-leaf-content.qa-xdf-feedback-inline ul.contains-task-list .task-list-item {
+/* ===== 单行 checkbox 组（InlineGroup 契约，见 src/xdf/InlineGroup.ts） =====
+   源文件为单行 `出勤：[ ] 正常 | [ ] 迟到 | ...`，渲染层负责内联化：
+   Live Preview 走 CM6 widget，阅读模式走 postprocessor。
+   这里只补间距与对齐，不涉及布局 hack。 */
+.xdf-inline-group .xdf-inline-item {
 	display: inline-flex;
 	align-items: center;
-	margin-right: 14px;
+	gap: 5px;
+	margin-right: 16px;
 	white-space: nowrap;
 }
 
-.workspace-leaf-content.qa-xdf-feedback-inline .cm-line.HyperMD-list-line.HyperMD-task-line {
-	display: inline-flex;
-	align-items: center;
-	margin-right: 14px;
-	white-space: nowrap;
-	/* 覆盖 Obsidian 悬挂缩进的内联样式（text-indent/padding-left），
-	   否则横排后首个项前出现大空白、项间距异常。作用域已被类名锁死。 */
-	padding-left: 0 !important;
-	text-indent: 0 !important;
+.xdf-inline-group .xdf-inline-checkbox,
+.cm-line .xdf-inline-checkbox {
+	vertical-align: middle;
+	margin: 0 2px 0 6px;
 }

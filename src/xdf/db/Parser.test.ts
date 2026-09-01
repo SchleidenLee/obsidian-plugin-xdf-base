@@ -6,6 +6,7 @@ import {
     splitSectionsWithRanges,
     parseHtmlCheckboxes,
     parseTaskCheckboxes,
+    parseInlineCheckboxGroups,
     parseFrontmatterBlock,
     parseFile,
 } from "./Parser";
@@ -286,5 +287,62 @@ describe("CRLF 兼容", () => {
         const lf = CRLF_FEEDBACK.split("\r\n");
         const crlfLines = CRLF_FEEDBACK.split("\n");
         expect(crlfLines).toHaveLength(lf.length); // 行数一致 → 行号区间有效
+    });
+});
+
+// ========== 单行 checkbox 组（Feedback 新契约，source='inline'） ==========
+
+describe("parseInlineCheckboxGroups", () => {
+    const BODY = [
+        "## 👤 张三",
+        "### 原始记录",
+        "#### 出勤",
+        "2026-08-31",
+        "出勤：[x] 正常 | [ ] 迟到 | [ ] 早退 | [ ] 线上课 | [ ] 请假",
+        "#### 作业情况",
+        "作业：[ ] 已完成 | [ ] 未完成",
+        "### 反馈总结",
+        "本周表现良好。",
+    ].join("\n");
+
+    it("出勤组：5 项、全 inline、首项勾选其余未勾、文字依次正确、归属最深 section", () => {
+        const items = parseInlineCheckboxGroups(BODY, splitSectionsWithRanges(BODY));
+        const attend = items.filter(i => i.section_path === "👤 张三/原始记录/出勤");
+        expect(attend.map(i => i.item_text)).toEqual(["正常", "迟到", "早退", "线上课", "请假"]);
+        expect(attend.every(i => i.source === "inline")).toBe(true);
+        expect(attend.map(i => i.checked)).toEqual([true, false, false, false, false]);
+    });
+
+    it("order_index 在整个文件范围内连续递增", () => {
+        const items = parseInlineCheckboxGroups(BODY, splitSectionsWithRanges(BODY));
+        expect(items.map(i => i.order_index)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    });
+
+    it("作业组：归属自己的 section，不串到出勤", () => {
+        const items = parseInlineCheckboxGroups(BODY, splitSectionsWithRanges(BODY));
+        const hw = items.filter(i => i.section_path === "👤 张三/原始记录/作业情况");
+        expect(hw.map(i => i.item_text)).toEqual(["已完成", "未完成"]);
+        expect(hw.every(i => i.source === "inline" && !i.checked)).toBe(true);
+    });
+
+    it("无组行不误报（含「出勤」字样的普通文本 / markdown task / 标签不在行首）", () => {
+        const plain = [
+            "## 👤 张三",
+            "### 原始记录",
+            "#### 出勤",
+            "8月31日出勤情况良好，无迟到早退。",
+            "出勤：见上方文字记录，无选项。",   // 组行格式但无 checkbox 项 → 0 条
+            "- [x] 正常",                      // markdown task：不属于 inline 解析范围
+            "今日出勤：[x] 正常",              // 标签前有文字，不在行首 → 不识别
+        ].join("\n");
+        expect(parseInlineCheckboxGroups(plain, splitSectionsWithRanges(plain))).toHaveLength(0);
+    });
+
+    it("parseFile 端到端：inline 组并入 checkboxes（与 html/task 合并口径一致）", () => {
+        const r = parseFile("Feedback 8", [], BODY);
+        expect(r.checkboxes).toHaveLength(7);
+        expect(r.checkboxes.every(c => c.source === "inline")).toBe(true);
+        const attend = r.checkboxes.filter(c => c.section_path === "👤 张三/原始记录/出勤");
+        expect(attend[0]).toMatchObject({ item_text: "正常", checked: true, source: "inline" });
     });
 });

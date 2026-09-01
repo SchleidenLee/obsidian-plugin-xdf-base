@@ -22,6 +22,8 @@
 	"author": "Christian B. B. Houmann",
 	"license": "MIT",
 	"devDependencies": {
+		"@codemirror/state": "^6.7.2",
+		"@codemirror/view": "^6.43.10",
 		"@sveltejs/vite-plugin-svelte": "^7.3.0",
 		"@testing-library/jest-dom": "^7.0.1",
 		"@testing-library/svelte": "^5.4.2",
@@ -53,11 +55,11 @@
 		"chrono-node": "^2.10.1",
 		"fuse.js": "7",
 		"obsidian-dataview": "^0.5.68",
+		"sql.js": "^1.10.3",
 		"svelte-dnd-action": "0.9.78",
 		"three-way-merge": "^0.1.0",
 		"uuid": "14",
-		"zustand": "^5.0.15",
-		"sql.js": "^1.10.3"
+		"zustand": "^5.0.15"
 	},
 	"repository": {
 		"type": "git",

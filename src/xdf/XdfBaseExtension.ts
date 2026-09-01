@@ -19,7 +19,7 @@ import { SchemaManager } from "./db/Schema";
 import { appendDbLog } from "./db/DbLog";
 import { ScriptReleaser } from "./scripts/ScriptReleaser";
 import { syncPresetChoices } from "./choiceManager";
-import { attachFeedbackInline, detachFeedbackInline } from "./FeedbackInline";
+import { registerInlineGroupRendering } from "./InlineGroup";
 
 export interface RebuildSummary {
     fileCount: number;
@@ -100,11 +100,12 @@ export class XdfBaseExtension {
             console.error("[XDF-Base] 事件监听启动失败:", err);
         }
 
-        // 5. Feedback 文件 task 横排（视图层打类名，纯渲染不涉及数据）
+        // 5. 单行 checkbox 组渲染（InlineGroup：CM6 decoration + 阅读模式 postprocessor，
+        //    均随插件生命周期自动清理，无需手动 detach）
         try {
-            attachFeedbackInline(this.app, this.plugin);
+            registerInlineGroupRendering(this.app, this.plugin);
         } catch (err) {
-            console.error("[XDF-Base] Feedback 内联样式挂载失败:", err);
+            console.error("[XDF-Base] InlineGroup 渲染挂载失败:", err);
         }
     }
 
@@ -184,7 +185,6 @@ export class XdfBaseExtension {
     async cleanup(): Promise<void> {
         try {
             this.sync.detach();
-            detachFeedbackInline(this.app);
             await this.db.close();
         } catch (err) {
             console.error("[XDF-Base] 清理失败:", err);

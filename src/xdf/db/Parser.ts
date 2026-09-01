@@ -47,7 +47,7 @@ export interface CheckboxDraft {
     section_path: string;
     item_text: string;
     checked: boolean;
-    source: "html" | "task";
+    source: "html" | "task" | "inline";
     order_index: number;
 }
 
@@ -355,6 +355,50 @@ export function parseTaskCheckboxes(
     return results;
 }
 
+// ========== 单行 checkbox 组（Feedback 新契约） ==========
+
+// 组行：行首固定标签（出勤|作业）+ 中文冒号 + ` | ` 分隔的 checkbox 项
+const INLINE_GROUP_RE = /^\s*(出勤|作业)：(.*)$/;
+// 单项：[x]/[ ] + 空格 + 选项文字（文字不含竖线）
+const INLINE_ITEM_RE = /^\[([ xX])\]\s*(.*)$/;
+
+/**
+ * 单行 checkbox 组解析（source='inline'）
+ *
+ * Feedback 文件的出勤/作业选项新契约：一行内 ` | ` 分隔多个 `[x] 选项`，
+ * 行首无 `- ` 前缀，metadataCache.listItems 不识别，必须正则解析正文。
+ * 例：`出勤：[x] 正常 | [ ] 迟到 | [ ] 早退`
+ *
+ * @param body   正文（不含 frontmatter；内部做 EOL 归一化，行号与 ranges 一致）
+ * @param ranges splitSectionsWithRanges 的切块行号区间（section 归属判定）
+ */
+export function parseInlineCheckboxGroups(
+    body: string,
+    ranges: SectionWithRange[]
+): CheckboxDraft[] {
+    const results: CheckboxDraft[] = [];
+    const lines = normalizeEol(body).split("\n");
+    let order = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const gm = lines[i].match(INLINE_GROUP_RE);
+        if (!gm) continue;
+        for (const rawItem of gm[2].split("|")) {
+            const im = rawItem.trim().match(INLINE_ITEM_RE);
+            if (!im) continue;
+            const text = im[2].trim();
+            if (!text) continue;
+            results.push({
+                section_path: findDeepestSectionPath(ranges, i),
+                item_text: text,
+                checked: im[1].toLowerCase() === "x",
+                source: "inline",
+                order_index: order++,
+            });
+        }
+    }
+    return results;
+}
+
 /**
  * 行号 → 最深 section 的 heading_path：
  * 父块区间包含子孙块（parseHeadings 的区间语义），命中多个时取 level 最深者
@@ -434,7 +478,10 @@ export function parseFile(
         checkboxes.push(...parseHtmlCheckboxes(sec.body, sec.heading_path));
     }
     // task → checkbox（按行号区间归属最深 section）
-    checkboxes.push(...parseTaskCheckboxes(tasks, splitSectionsWithRanges(content)));
+    // 单行 checkbox 组 → checkbox（Feedback 新契约，source='inline'，同按行号归属）
+    const ranges = splitSectionsWithRanges(content);
+    checkboxes.push(...parseTaskCheckboxes(tasks, ranges));
+    checkboxes.push(...parseInlineCheckboxGroups(content, ranges));
 
     // nav 专有：提交反馈勾选
     let feedbackSent: boolean | null = null;

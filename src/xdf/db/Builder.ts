@@ -19,6 +19,7 @@ import {
     splitSectionsWithRanges,
     parseHtmlCheckboxes,
     parseTaskCheckboxes,
+    parseInlineCheckboxGroups,
     isLeafSection,
     normalizeTags,
     type FileKind,
@@ -439,7 +440,7 @@ export class DBWriter {
             secCount++;
         }
 
-        // checkboxes：html（叶子块）+ task
+        // checkboxes：html（叶子块）+ task + 单行 checkbox 组（Feedback 新契约）
         let cbCount = 0;
         for (const sec of sections) {
             if (!isLeafSection(sec, sections)) continue;
@@ -448,7 +449,11 @@ export class DBWriter {
                 this.insertCheckbox(f.path, item, cbCount++);
             }
         }
-        for (const item of parseTaskCheckboxes(parseMarkdownTasks(body), splitSectionsWithRanges(body))) {
+        const ranges = splitSectionsWithRanges(body);
+        for (const item of parseTaskCheckboxes(parseMarkdownTasks(body), ranges)) {
+            this.insertCheckbox(f.path, item, cbCount++);
+        }
+        for (const item of parseInlineCheckboxGroups(body, ranges)) {
             this.insertCheckbox(f.path, item, cbCount++);
         }
 
