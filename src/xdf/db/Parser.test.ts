@@ -325,7 +325,7 @@ describe("parseInlineCheckboxGroups", () => {
         expect(hw.every(i => i.source === "inline" && !i.checked)).toBe(true);
     });
 
-    it("无组行不误报（含「出勤」字样的普通文本 / markdown task / 标签不在行首）", () => {
+    it("无组行不误报（含「出勤」字样的普通文本 / markdown task / 单项不成组）", () => {
         const plain = [
             "## 👤 张三",
             "### 原始记录",
@@ -333,9 +333,27 @@ describe("parseInlineCheckboxGroups", () => {
             "8月31日出勤情况良好，无迟到早退。",
             "出勤：见上方文字记录，无选项。",   // 组行格式但无 checkbox 项 → 0 条
             "- [x] 正常",                      // markdown task：不属于 inline 解析范围
-            "今日出勤：[x] 正常",              // 标签前有文字，不在行首 → 不识别
+            "今日出勤：[x] 正常",              // 仅 1 项 → 不构成组
         ].join("\n");
         expect(parseInlineCheckboxGroups(plain, splitSectionsWithRanges(plain))).toHaveLength(0);
+    });
+
+    it("合并格式：标签可为任意文字（9月1日出勤情况：/第8次阅读作业：），旧出勤：前缀兼容", () => {
+        const merged = [
+            "## 👤 张三",
+            "### 原始记录",
+            "#### 出勤",
+            "9月1日出勤情况：[x] 正常 | [ ] 迟到 | [ ] 早退",
+            "#### 作业情况",
+            "第8次阅读作业：[ ] 已完成 | [ ] 未完成",
+        ].join("\n");
+        const items = parseInlineCheckboxGroups(merged, splitSectionsWithRanges(merged));
+        expect(items).toHaveLength(5);
+        expect(items.map(i => i.item_text)).toEqual(["正常", "迟到", "早退", "已完成", "未完成"]);
+        expect(items.filter(i => i.section_path === "👤 张三/原始记录/出勤").map(i => i.item_text))
+            .toEqual(["正常", "迟到", "早退"]);
+        // 旧「出勤：」前缀（已迁移文件）仍可解析
+        expect(parseInlineCheckboxGroups(BODY, splitSectionsWithRanges(BODY))).toHaveLength(7);
     });
 
     it("parseFile 端到端：inline 组并入 checkboxes（与 html/task 合并口径一致）", () => {

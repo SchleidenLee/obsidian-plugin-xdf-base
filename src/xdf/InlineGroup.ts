@@ -3,6 +3,7 @@
  *
  * 契约（见 archive-utils.ts buildPersonFeedback 注释）：
  *   出勤：[ ] 正常 | [ ] 迟到 | [ ] 早退 | [ ] 线上课 | [ ] 请假
+ *   （标签任意，9月1日出勤情况：/第8次阅读作业： 均可）
  *   作业：[ ] 已完成 | [ ] 未完成
  * 源文件单行 → CodeMirror 行几何不被破坏（多行 CSS 压横排已证伪），
  * 本模块负责把 `[ ]` / `[x]` 与 ` | ` 渲染为内联 checkbox：
@@ -18,8 +19,8 @@ import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, typ
 import { RangeSetBuilder } from "@codemirror/state";
 import { editorLivePreviewField, type App, type Plugin, type TFile } from "obsidian";
 
-/** 组行：行首标签（出勤|作业）+ 中文冒号 */
-const GROUP_LINE_RE = /^\s*(出勤|作业)：/;
+/** 组行：任意短标签（≤40 字符、不含冒号/换行）+ 中文冒号，结构校验在 parseGroupLine */
+const GROUP_LABEL_RE = /^[^：\n]{1,40}：/;
 /** 单个 item：[ ] / [x] / [X]（精确 3 字符的勾选标记） */
 const ITEM_RE = /\[([ xX])\]/g;
 /** item 间分隔符（连同两侧空白一起隐藏） */
@@ -31,15 +32,28 @@ interface GroupItem {
 	index: number;
 }
 
+/**
+ * 识别单行 checkbox 组：标签 + 中文冒号 + ` | ` 分隔的 ≥2 个合法选项。
+ * 标签任意（出勤：/9月1日出勤情况：/第8次阅读作业：均可），与 DB 端
+ * Parser.parseInlineCheckboxGroups 同一契约。
+ */
 function parseGroupLine(text: string): GroupItem[] | null {
-	if (!GROUP_LINE_RE.test(text)) return null;
+	const ci = text.indexOf("：");
+	if (ci <= 0 || ci > 40 || !GROUP_LABEL_RE.test(text)) return null;
+	const rest = text.slice(ci + 1);
+	if (!rest.includes("|")) return null;
+	const segs = rest.split("|").map(s => s.trim());
+	if (segs.length < 2) return null;
+	for (const s of segs) {
+		if (!/^\[[ xX]\]\s*\S/.test(s)) return null;
+	}
 	const items: GroupItem[] = [];
 	ITEM_RE.lastIndex = 0;
 	let m: RegExpExecArray | null;
 	while ((m = ITEM_RE.exec(text)) !== null) {
 		items.push({ checked: m[1] !== " ", index: m.index });
 	}
-	return items.length > 0 ? items : null;
+	return items.length >= 2 ? items : null;
 }
 
 /** 取行内第 target 个 item 的文字（勾选标记之后、下一个分隔符之前） */
@@ -223,7 +237,7 @@ export function registerInlineGroupRendering(app: App, plugin: Plugin): void {
 		const blocks = el.querySelectorAll<HTMLElement>("p");
 		for (const block of Array.from(blocks)) {
 			const text = block.textContent ?? "";
-			if (!GROUP_LINE_RE.test(text) || !/\[[ xX]\]/.test(text)) continue;
+			if (!parseGroupLine(text)) continue;
 			const info = ctx.getSectionInfo(block);
 			// MarkdownSectionInformation: { text, lineStart, lineEnd }
 			const line = info ? info.lineStart : null;

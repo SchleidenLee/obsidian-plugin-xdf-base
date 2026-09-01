@@ -642,8 +642,8 @@ async function pickStartingDate() {
 // ========== 模板 ==========
 
 function buildPersonFeedback(opts) {
-    // 出勤/作业为单行 checkbox 组契约：源文件中每组保持单行（以"出勤："/"作业："开头，
-    // " | "分隔），保证 CodeMirror 几何安全；插件负责渲染为内联 checkbox，
+    // 出勤/作业为单行 checkbox 组契约：源文件中每组保持单行（任意短标签 + 中文冒号 +
+    // " | "分隔的 ≥2 个选项），保证 CodeMirror 几何安全；插件负责渲染为内联 checkbox，
     // DB 以 source='inline' 解析；全部默认不勾——勾选状态必须来自老师手动点击，杜绝模板默认值污染数据
     const lines = [
         "## 👤 " + opts.name,
@@ -651,8 +651,7 @@ function buildPersonFeedback(opts) {
         "",
         "### 原始记录",
         "#### 出勤",
-        opts.month + "月" + opts.day + "日出勤情况：",
-        "出勤：[ ] 正常 | [ ] 迟到 | [ ] 早退 | [ ] 线上课 | [ ] 请假",
+        opts.month + "月" + opts.day + "日出勤情况：[ ] 正常 | [ ] 迟到 | [ ] 早退 | [ ] 线上课 | [ ] 请假",
         "",
         ""
     ];
@@ -661,8 +660,7 @@ function buildPersonFeedback(opts) {
         const homeworkLabel = buildHomeworkLabel(opts.lessonNumber - 1, opts.subject);
         lines.push(
             "#### 作业情况",
-            homeworkLabel + "：",
-            "作业：[ ] 已完成 | [ ] 未完成",
+            homeworkLabel + "：[ ] 已完成 | [ ] 未完成",
             "",
             ""
         );

@@ -357,8 +357,10 @@ export function parseTaskCheckboxes(
 
 // ========== 单行 checkbox 组（Feedback 新契约） ==========
 
-// 组行：行首固定标签（出勤|作业）+ 中文冒号 + ` | ` 分隔的 checkbox 项
-const INLINE_GROUP_RE = /^\s*(出勤|作业)：(.*)$/;
+// 组行：任意短标签（≤40字符、不含冒号/换行）+ 中文冒号 + ` | ` 分隔的 checkbox 项
+// 例：`出勤：[x] 正常 | [ ] 迟到`、`9月1日出勤情况：[x] 正常 | [ ] 迟到`
+// 结构校验（每段合法 + ≥2 项）在 parseInlineCheckboxGroups 内完成
+const INLINE_GROUP_RE = /^\s*([^：\n]{1,40})：(.*)$/;
 // 单项：[x]/[ ] + 空格 + 选项文字（文字不含竖线）
 const INLINE_ITEM_RE = /^\[([ xX])\]\s*(.*)$/;
 
@@ -367,7 +369,8 @@ const INLINE_ITEM_RE = /^\[([ xX])\]\s*(.*)$/;
  *
  * Feedback 文件的出勤/作业选项新契约：一行内 ` | ` 分隔多个 `[x] 选项`，
  * 行首无 `- ` 前缀，metadataCache.listItems 不识别，必须正则解析正文。
- * 例：`出勤：[x] 正常 | [ ] 迟到 | [ ] 早退`
+ * 标签任意（出勤：/9月1日出勤情况：/第8次阅读作业：均可），但冒号后
+ * 每段都必须是合法 checkbox 项，且整行 ≥2 项，否则不视为组行。
  *
  * @param body   正文（不含 frontmatter；内部做 EOL 归一化，行号与 ranges 一致）
  * @param ranges splitSectionsWithRanges 的切块行号区间（section 归属判定）
@@ -382,15 +385,14 @@ export function parseInlineCheckboxGroups(
     for (let i = 0; i < lines.length; i++) {
         const gm = lines[i].match(INLINE_GROUP_RE);
         if (!gm) continue;
-        for (const rawItem of gm[2].split("|")) {
-            const im = rawItem.trim().match(INLINE_ITEM_RE);
-            if (!im) continue;
-            const text = im[2].trim();
-            if (!text) continue;
+        const parts = gm[2].split("|").map(s => s.trim().match(INLINE_ITEM_RE));
+        // 结构校验：≥2 项且每段都是合法 checkbox 项，否则视为普通文本
+        if (parts.length < 2 || parts.some(p => !p || !p[2].trim())) continue;
+        for (const im of parts) {
             results.push({
                 section_path: findDeepestSectionPath(ranges, i),
-                item_text: text,
-                checked: im[1].toLowerCase() === "x",
+                item_text: im![2].trim(),
+                checked: im![1].toLowerCase() === "x",
                 source: "inline",
                 order_index: order++,
             });
