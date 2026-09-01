@@ -2544,10 +2544,13 @@ textarea.is-valid {
 }
 
 /* ===== Feedback 文件（契约命名 Feedback N.md）出勤/作业 task 内联并排 =====
-   作用域 = data-path 路径契约匹配（零 frontmatter）。Feedback 文件内唯一的
-   task 列表就是出勤/作业组，无需标题相邻条件。仅阅读视图渲染为列表 DOM；
-   Live Preview 编辑态一行一项属正常编辑行为。 */
-.workspace-leaf-content[data-path*="/Feedback "] ul.contains-task-list {
+   作用域 = qa-xdf-feedback-inline 类（src/xdf/FeedbackInline.ts 在打开契约文件时
+   打到 .workspace-leaf-content 上，零 frontmatter）。已用 DevTools 注入实验验证
+   两种模式均可横排：
+   阅读视图：ul/li 列表 DOM，flex 换行；
+   Live Preview：task 是逐行 .cm-line.HyperMD-task-line 编辑行（每项独立块级行），
+   inline-flex 横排（限定 HyperMD-task-line，避免影响普通列表行）。 */
+.workspace-leaf-content.qa-xdf-feedback-inline ul.contains-task-list {
 	display: flex;
 	flex-wrap: wrap;
 	list-style: none;
@@ -2555,7 +2558,16 @@ textarea.is-valid {
 	row-gap: 2px;
 }
 
-.workspace-leaf-content[data-path*="/Feedback "] ul.contains-task-list .task-list-item {
-	display: inline-block;
+.workspace-leaf-content.qa-xdf-feedback-inline ul.contains-task-list .task-list-item {
+	display: inline-flex;
+	align-items: center;
 	margin-right: 14px;
+	white-space: nowrap;
+}
+
+.workspace-leaf-content.qa-xdf-feedback-inline .cm-line.HyperMD-list-line.HyperMD-task-line {
+	display: inline-flex;
+	align-items: center;
+	margin-right: 14px;
+	white-space: nowrap;
 }

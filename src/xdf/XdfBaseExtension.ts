@@ -19,6 +19,7 @@ import { SchemaManager } from "./db/Schema";
 import { appendDbLog } from "./db/DbLog";
 import { ScriptReleaser } from "./scripts/ScriptReleaser";
 import { syncPresetChoices } from "./choiceManager";
+import { attachFeedbackInline, detachFeedbackInline } from "./FeedbackInline";
 
 export interface RebuildSummary {
     fileCount: number;
@@ -98,6 +99,13 @@ export class XdfBaseExtension {
         } catch (err) {
             console.error("[XDF-Base] 事件监听启动失败:", err);
         }
+
+        // 5. Feedback 文件 task 横排（视图层打类名，纯渲染不涉及数据）
+        try {
+            attachFeedbackInline(this.app, this.plugin);
+        } catch (err) {
+            console.error("[XDF-Base] Feedback 内联样式挂载失败:", err);
+        }
     }
 
     /**
@@ -176,6 +184,7 @@ export class XdfBaseExtension {
     async cleanup(): Promise<void> {
         try {
             this.sync.detach();
+            detachFeedbackInline(this.app);
             await this.db.close();
         } catch (err) {
             console.error("[XDF-Base] 清理失败:", err);
