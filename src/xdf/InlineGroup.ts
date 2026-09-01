@@ -16,7 +16,7 @@
 
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import { RangeSetBuilder } from "@codemirror/state";
-import type { App, Plugin, TFile } from "obsidian";
+import { editorLivePreviewField, type App, type Plugin, type TFile } from "obsidian";
 
 /** 组行：行首标签（出勤|作业）+ 中文冒号 */
 const GROUP_LINE_RE = /^\s*(出勤|作业)：/;
@@ -98,6 +98,8 @@ class InlineCheckboxWidget extends WidgetType {
 }
 
 function buildDecorations(view: EditorView): DecorationSet {
+	// 仅实时预览渲染；纯源码模式保持原文（widget 会干扰编辑）
+	if (view.state.field(editorLivePreviewField, false) !== true) return Decoration.none;
 	const builder = new RangeSetBuilder<Decoration>();
 	for (const range of view.visibleRanges) {
 		for (let pos = range.from; pos <= range.to; ) {
@@ -111,12 +113,17 @@ function buildDecorations(view: EditorView): DecorationSet {
 					builder.add(tokenFrom, tokenFrom + 3, Decoration.replace({
 						widget: new InlineCheckboxWidget(item.checked, tokenFrom),
 					}));
-					// 隐藏 item 之间的 ` | ` 分隔符
+					// 仅隐藏 item 之间的 ` | ` 分隔符（保留标签文字）：
+					// 从标签文字结束（分隔符起点）到下一个 `[`
 					if (i < items.length - 1) {
-						const sepFrom = tokenFrom + 3;
-						const nextStart = line.from + items[i + 1].index;
-						if (nextStart > sepFrom) {
-							builder.add(sepFrom, nextStart, Decoration.replace({}));
+						const after = line.text.slice(item.index + 3);
+						const sep = SEP_RE.exec(after);
+						if (sep) {
+							const sepFrom = tokenFrom + 3 + sep.index;
+							const nextStart = line.from + items[i + 1].index;
+							if (nextStart > sepFrom) {
+								builder.add(sepFrom, nextStart, Decoration.replace({}));
+							}
 						}
 					}
 				}
@@ -133,7 +140,9 @@ class InlineGroupView {
 		this.decorations = buildDecorations(view);
 	}
 	update(update: ViewUpdate): void {
-		if (update.docChanged || update.viewportChanged) {
+		const wasLive = update.startState.field(editorLivePreviewField, false);
+		const isLive = update.state.field(editorLivePreviewField, false);
+		if (update.docChanged || update.viewportChanged || wasLive !== isLive) {
 			this.decorations = buildDecorations(update.view);
 		}
 	}
@@ -206,7 +215,7 @@ function renderReadingGroup(
 // ================= 接线 =================
 
 export function registerInlineGroupRendering(app: App, plugin: Plugin): void {
-	// 实时预览（含源码模式）：CM6 decoration
+	// 实时预览（源码模式不渲染）：CM6 decoration
 	plugin.registerEditorExtension(inlineGroupViewPlugin);
 
 	// 阅读模式：postprocessor 重建段落
