@@ -16,7 +16,9 @@ import {
     parseFrontmatterBlock,
     parseMarkdownTasks,
     splitSections,
+    splitSectionsWithRanges,
     parseHtmlCheckboxes,
+    parseTaskCheckboxes,
     isLeafSection,
     normalizeTags,
     type FileKind,
@@ -446,14 +448,8 @@ export class DBWriter {
                 this.insertCheckbox(f.path, item, cbCount++);
             }
         }
-        for (const t of parseMarkdownTasks(body)) {
-            this.insertCheckbox(f.path, {
-                section_path: "", // task 归属行号在纯函数层不做，正文级即可查
-                item_text: t.text,
-                checked: t.checked,
-                source: "task",
-                order_index: 0,
-            }, cbCount++);
+        for (const item of parseTaskCheckboxes(parseMarkdownTasks(body), splitSectionsWithRanges(body))) {
+            this.insertCheckbox(f.path, item, cbCount++);
         }
 
         return { sections: secCount, checkboxes: cbCount };

@@ -3,7 +3,9 @@ import {
     detectKind,
     normalizeTags,
     splitSections,
+    splitSectionsWithRanges,
     parseHtmlCheckboxes,
+    parseTaskCheckboxes,
     parseFrontmatterBlock,
     parseFile,
 } from "./Parser";
@@ -167,6 +169,69 @@ describe("parseFile", () => {
             { text: "提交反馈", checked: false, position: { start: 0, end: 0 } },
         ]);
         expect(r.feedbackSent).toBe(false);
+    });
+});
+
+// ========== task → section 归属（〇-B checkbox 迁移配套） ==========
+
+describe("parseTaskCheckboxes / 行号归属", () => {
+    const BODY = [
+        "## 👤 张三",
+        "### 原始记录",
+        "#### 出勤",
+        "8月31日出勤情况：",
+        "",
+        "- [x] 正常",
+        "- [ ] 迟到",
+        "#### 作业情况",
+        "第5次阅读作业：",
+        "",
+        "- [ ] 已完成",
+        "- [ ] 未完成",
+        "### 反馈总结",
+        "本周表现良好。",
+    ].join("\n");
+
+    it("task 归属最深 section（👤/原始记录/出勤）", () => {
+        const tasks = [
+            { text: "正常", checked: true, position: { start: 5, end: 6 } },
+            { text: "迟到", checked: false, position: { start: 6, end: 7 } },
+        ];
+        const r = parseTaskCheckboxes(tasks, splitSectionsWithRanges(BODY));
+        expect(r[0]).toMatchObject({
+            section_path: "👤 张三/原始记录/出勤",
+            item_text: "正常",
+            checked: true,
+            source: "task",
+        });
+        expect(r[1].section_path).toBe("👤 张三/原始记录/出勤");
+    });
+
+    it("作业组归属自己的 section，不串到出勤", () => {
+        const tasks = [
+            { text: "已完成", checked: false, position: { start: 10, end: 11 } },
+        ];
+        const r = parseTaskCheckboxes(tasks, splitSectionsWithRanges(BODY));
+        expect(r[0].section_path).toBe("👤 张三/原始记录/作业情况");
+    });
+
+    it("首标题前正文（level=0 区间）→ 空串", () => {
+        const withPreamble = "前言内容\n" + BODY;
+        const tasks = [
+            { text: "提交反馈", checked: false, position: { start: 0, end: 1 } },
+        ];
+        const r = parseTaskCheckboxes(tasks, splitSectionsWithRanges(withPreamble));
+        expect(r[0].section_path).toBe("");
+    });
+
+    it("parseFile 端到端：task checkbox 挂到学员级 section_path", () => {
+        const r = parseFile("Feedback 8", [], BODY, [
+            { text: "正常", checked: true, position: { start: 5, end: 6 } },
+            { text: "已完成", checked: false, position: { start: 10, end: 11 } },
+        ]);
+        const byText = Object.fromEntries(r.checkboxes.map(c => [c.item_text, c]));
+        expect(byText["正常"].section_path).toBe("👤 张三/原始记录/出勤");
+        expect(byText["已完成"].section_path).toBe("👤 张三/原始记录/作业情况");
     });
 });
 

@@ -77,14 +77,14 @@ describe("Builder 全量重建（真实 Reference 数据）", () => {
         stats = new DBWriter(db).rebuildAll(files);
     });
 
-    it("档案数：18 班课 + 18 一对一 = 36", () => {
+    it("档案数：18 班课 + 19 一对一 = 37", () => {
         expect(stats.errors).toEqual([]);
-        expect(stats.archives).toBe(36);
+        expect(stats.archives).toBe(37);
         const kinds = db.query<{ kind: string; c: number }>(
             "SELECT kind, COUNT(*) c FROM archives GROUP BY kind"
         );
         const byKind = Object.fromEntries(kinds.map(k => [k.kind, k.c]));
-        expect(byKind.vip).toBe(18);
+        expect(byKind.vip).toBe(19);
         expect(byKind.class).toBe(18);
     });
 

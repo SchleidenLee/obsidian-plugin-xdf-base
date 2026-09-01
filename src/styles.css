@@ -2539,6 +2539,23 @@ textarea.is-valid {
 
 /* Input frozen while a pasted clipboard image is being saved (issue #1484). */
 .qa-image-paste-busy {
-	opacity: 0.7;
-	cursor: progress;
+        opacity: 0.7;
+        cursor: progress;
+}
+
+/* ===== Feedback 文件（契约命名 Feedback N.md）出勤/作业 task 内联并排 =====
+   作用域 = data-path 路径契约匹配（零 frontmatter）。Feedback 文件内唯一的
+   task 列表就是出勤/作业组，无需标题相邻条件。仅阅读视图渲染为列表 DOM；
+   Live Preview 编辑态一行一项属正常编辑行为。 */
+.workspace-leaf-content[data-path*="/Feedback "] ul.contains-task-list {
+	display: flex;
+	flex-wrap: wrap;
+	list-style: none;
+	padding-left: 0;
+	row-gap: 2px;
+}
+
+.workspace-leaf-content[data-path*="/Feedback "] ul.contains-task-list .task-list-item {
+	display: inline-block;
+	margin-right: 14px;
 }

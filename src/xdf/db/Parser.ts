@@ -334,23 +334,18 @@ export function parseHtmlCheckboxes(
 
 /**
  * markdown task 解析结果 → CheckboxDraft（source='task'）
- * 挂到 task 所在的 section（heading_path 最深匹配）
+ * 按行号区间归属所在 section（取包含该行的最深 section），
+ * 不在任何 section 内（首标题前正文）→ 空串
  */
 export function parseTaskCheckboxes(
     tasks: TaskInfo[],
-    sections: SectionDraft[]
+    ranges: SectionWithRange[]
 ): CheckboxDraft[] {
     const results: CheckboxDraft[] = [];
-    // 展平行号区间：需要 sections 带行号，这里用近似——直接全文顺序
-    // （调用方 Builder 传 line 区间信息；此函数按 task 文字去重后顺序编号）
-    const seen = new Set<string>();
     let order = 0;
     for (const t of tasks) {
-        const key = `${t.position.start}:${t.text}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
         results.push({
-            section_path: findSectionPathForLine(sections, t.position.start) ?? "",
+            section_path: findDeepestSectionPath(ranges, t.position.start),
             item_text: t.text,
             checked: t.checked,
             source: "task",
@@ -361,33 +356,43 @@ export function parseTaskCheckboxes(
 }
 
 /**
- * task 所在行归属哪个 section：需要行号 → 这里通过 sections 的 order 与外部传入的行区间对齐。
- * 简化实现：sections 不带行号，故返回空串交由调用方在 Builder 层补（保持 Parser 纯函数边界）。
+ * 行号 → 最深 section 的 heading_path：
+ * 父块区间包含子孙块（parseHeadings 的区间语义），命中多个时取 level 最深者
  */
-function findSectionPathForLine(_sections: SectionDraft[], _line: number): string | null {
-    // 行号对齐在 Builder 层完成（splitSections 已可返回区间，见 splitSectionsWithRanges）
-    return null;
+export function findDeepestSectionPath(
+    ranges: SectionWithRange[],
+    line: number
+): string {
+    let best: SectionWithRange | null = null;
+    for (const r of ranges) {
+        if (line >= r.startLine && line < r.endLine) {
+            if (!best || r.level > best.level) best = r;
+        }
+    }
+    return best ? best.heading_path : "";
 }
 
 /**
  * 带 heading 行区间的切块（Builder 用于 task/checkbox 归属判定）
  */
 export interface SectionWithRange extends SectionDraft {
-    headingStartLine: number; // 该块首标题行（level=0 为块起始行）
+    startLine: number; // 块起始行（level=0 为 0；heading 块为标题行）
+    endLine: number;   // 块结束行（不含，parseHeadings 的区间语义）
 }
 
 export function splitSectionsWithRanges(body: string): SectionWithRange[] {
     const sections = splitSections(body);
     const headings = parseHeadings(body);
-    // level=0 兜底条首行 = 0；heading 条首行 = 对应 heading 行
     const withRanges: SectionWithRange[] = [];
     let headingIdx = 0;
     for (const s of sections) {
         if (s.level === 0) {
-            withRanges.push({ ...s, headingStartLine: 0 });
+            // level=0 兜底条：[0, 首标题行)；无标题全文时到末尾
+            const firstHeading = headings.length ? headings[0].position.start : (body.split("\n").length);
+            withRanges.push({ ...s, startLine: 0, endLine: firstHeading });
         } else {
             const h = headings[headingIdx++];
-            withRanges.push({ ...s, headingStartLine: h.position.start });
+            withRanges.push({ ...s, startLine: h.position.start, endLine: h.position.end });
         }
     }
     return withRanges;
@@ -428,17 +433,8 @@ export function parseFile(
         if (!isLeafSection(sec, sections)) continue;
         checkboxes.push(...parseHtmlCheckboxes(sec.body, sec.heading_path));
     }
-    // task → checkbox（归属 section 由行号区间判定，这里做简单版：按 task 出现顺序）
-    for (let i = 0; i < tasks.length; i++) {
-        const t = tasks[i];
-        checkboxes.push({
-            section_path: "",
-            item_text: t.text,
-            checked: t.checked,
-            source: "task" as const,
-            order_index: checkboxes.length,
-        });
-    }
+    // task → checkbox（按行号区间归属最深 section）
+    checkboxes.push(...parseTaskCheckboxes(tasks, splitSectionsWithRanges(content)));
 
     // nav 专有：提交反馈勾选
     let feedbackSent: boolean | null = null;

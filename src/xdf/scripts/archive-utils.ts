@@ -642,13 +642,21 @@ async function pickStartingDate() {
 // ========== 模板 ==========
 
 function buildPersonFeedback(opts) {
+    // 出勤/作业用 markdown task（点击可保存，勾选状态 2.5s 内入数据库）；
+    // 全部默认不勾——勾选状态必须来自老师手动点击，杜绝模板默认值污染数据
     const lines = [
         "## 👤 " + opts.name,
         "",
         "",
         "### 原始记录",
         "#### 出勤",
-        opts.month + "月" + opts.day + "日出勤情况：<input type=\"checkbox\" checked> 正常 <input type=\"checkbox\"> 迟到 <input type=\"checkbox\"> 早退 <input type=\"checkbox\"> 线上课 <input type=\"checkbox\"> 请假",
+        opts.month + "月" + opts.day + "日出勤情况：",
+        "",
+        "- [ ] 正常",
+        "- [ ] 迟到",
+        "- [ ] 早退",
+        "- [ ] 线上课",
+        "- [ ] 请假",
         "",
         ""
     ];
@@ -657,7 +665,10 @@ function buildPersonFeedback(opts) {
         const homeworkLabel = buildHomeworkLabel(opts.lessonNumber - 1, opts.subject);
         lines.push(
             "#### 作业情况",
-            homeworkLabel + "：<input type=\"checkbox\"> 已完成 <input type=\"checkbox\"> 未完成",
+            homeworkLabel + "：",
+            "",
+            "- [ ] 已完成",
+            "- [ ] 未完成",
             "",
             ""
         );
