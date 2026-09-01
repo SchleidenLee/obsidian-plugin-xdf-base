@@ -2570,4 +2570,8 @@ textarea.is-valid {
 	align-items: center;
 	margin-right: 14px;
 	white-space: nowrap;
+	/* 覆盖 Obsidian 悬挂缩进的内联样式（text-indent/padding-left），
+	   否则横排后首个项前出现大空白、项间距异常。作用域已被类名锁死。 */
+	padding-left: 0 !important;
+	text-indent: 0 !important;
 }
