@@ -37,12 +37,26 @@ XDF 教学系统核心 Obsidian 插件：在 [QuickAdd](https://github.com/chhou
 基于 sql.js (WASM) 的 vault 数据同步层，数据落地到 `vault/.xdf/xdf.db`（隐藏目录），供 MCP 工具与 AI 查询：
 
 - **7 表结构**：实体层（students / archives / lessons / class_roster）+ 内容层（sections / files / checkboxes）
-- **契约文件全量细粒度入库**：档案页、课次 nav、课次包 7 文件、反馈页——frontmatter 实体化、正文按 heading 切块（`👤 张三/原始记录/出勤` 级路径）、HTML checkbox 与 markdown task 双来源解析
+- **契约文件全量细粒度入库**：档案页、课次 nav、课次包 7 文件、反馈页——frontmatter 实体化、正文按 heading 切块（`👤 张三/原始记录/出勤` 级路径）、checkbox 三来源解析（HTML / markdown task / 单行内联组）
 - **脏数据只登记路径**：契约外的 md 与非 md 附件（pdf/ppt 等）在 files 表登记路径与归属，不读内容
 - **增量同步**：文件变更 500ms debounce + 2s 节流，只重写受影响文件的行；上课连续记笔记不打扰
 - **启动自愈**：空库自动全量重建；旧库按 mtime 对账补漏（外部改动文件不丢）
 - **最终一致**：md 是唯一数据源，数据库落后最多约 2.5 秒；同步失败写入 `00.SYSTEM/Logs/ai-log.md`
 - **查询入口**：`app.plugins.plugins["xdf-base"].api.db.query(sql)`（只读推荐走 MCP 拷贝副本）
+
+### 6. Feedback 内联 checkbox 组
+
+出勤/作业等勾选项采用**单行组格式**，一行既是源码也是数据：
+
+```
+9月1日出勤情况：[x] 正常 | [ ] 迟到 | [ ] 早退 | [ ] 线上课 | [ ] 请假
+第8次作业：[ ] 已完成 | [ ] 未完成
+```
+
+- **实时预览**：CodeMirror 6 ViewPlugin + WidgetType 渲染为真实 checkbox，点击直接改写源码 `[ ]`/`[x]`，不破坏编辑器几何（无光标漂移）；纯源码模式不过滤、显示原文
+- **阅读模式**：MarkdownPostProcessor 渲染同样的交互组件
+- **自动入库**：勾选状态经增量同步写入 `checkboxes` 表（`source='inline'`），可按 `section_path` 聚合查询出勤/作业结论；组行下手写的评语文字随 `sections.body` 一并入库
+- **模板内置**：新生成的课次包 Feedback 自动使用该格式，旧格式（`出勤：…` 独立行）完全兼容
 
 ## 构建
 
