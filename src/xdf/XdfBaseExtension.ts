@@ -95,9 +95,9 @@ export class XdfBaseExtension {
         // 4. 启动 vault 事件监听（数据库就绪后才挂）
         try {
             this.sync.attach();
-            console.log("[XDF-Base] 事件监听已启动");
+            console.log("[XDF Base] 事件监听已启动");
         } catch (err) {
-            console.error("[XDF-Base] 事件监听启动失败:", err);
+            console.error("[XDF Base] 事件监听启动失败:", err);
         }
 
         // 5. 单行 checkbox 组渲染（InlineGroup：CM6 decoration + 阅读模式 postprocessor，
@@ -175,7 +175,7 @@ export class XdfBaseExtension {
                 }
             }
             await this.db.save();
-            console.log(`[XDF-Base] 启动对账完成：补写 ${stale.length} 个文件`);
+            console.log(`[XDF Base] 启动对账完成：补写 ${stale.length} 个文件`);
         }
     }
 

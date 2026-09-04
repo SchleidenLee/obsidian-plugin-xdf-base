@@ -42,7 +42,7 @@ export async function appendDbLog(app: App, entry: DbLogEntry): Promise<void> {
             );
         }
     } catch (err) {
-        console.error("[XDF-Base] 写 ai-log 失败（降级 console）:", err, entry);
+        console.error("[XDF Base] 写 ai-log 失败（降级 console）:", err, entry);
     }
 }
 

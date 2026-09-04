@@ -88,7 +88,7 @@ const SETTINGS_SAVE_DEBOUNCE_MS = 1000;
 export default class QuickAdd extends Plugin {
 	settings: QuickAddSettings;
 	private unsubscribeSettingsStore: () => void;
-	// XDF-Base 扩展实例（在 onload 末尾初始化，onunload 时清理）
+	// XDF Base 扩展实例（在 onload 末尾初始化，onunload 时清理）
 	private xdfBase: XdfBaseExtension | null = null;
 	// Debounced disk write for the store subscriber. saveSettings() stays immediate
 	// (migrations await it) and cancels this; onunload flushes it.
@@ -515,7 +515,7 @@ export default class QuickAdd extends Plugin {
 		interactivePromptServer.stop();
 		PromptPeekSession.getActive()?.cancel();
 
-		// XDF-Base 清理（关数据库、停事件监听）
+		// XDF Base 清理（关数据库、停事件监听）
 		if (this.xdfBase) {
 			void this.xdfBase.cleanup();
 			this.xdfBase = null;

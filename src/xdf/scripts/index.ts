@@ -1,5 +1,5 @@
 /**
- * XDF-Base 内置脚本导出
+ * XDF Base 内置脚本导出
  *
  * 这些脚本会被 esbuild 打包进 main.js，并在首次启动时释放到
  * 00.SYSTEM/xdf_base/scripts/ 目录。

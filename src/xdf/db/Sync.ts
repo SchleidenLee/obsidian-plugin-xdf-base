@@ -207,7 +207,7 @@ export class DBSync {
             for (const s of archiveSnaps) {
                 const stats = writer.upsertFile(s);
                 if (stats.errors.length > 0) {
-                    console.error("[XDF-Base] 增量写入失败（档案页）:", stats.errors);
+                    console.error("[XDF Base] 增量写入失败（档案页）:", stats.errors);
                     for (const e of stats.errors) {
                         void appendDbLog(this.app, {
                             level: "error", source: "DB同步",
@@ -232,7 +232,7 @@ export class DBSync {
             for (const s of otherSnaps) {
                 const stats = writer.upsertFile(s);
                 if (stats.errors.length > 0) {
-                    console.error("[XDF-Base] 增量写入失败:", stats.errors);
+                    console.error("[XDF Base] 增量写入失败:", stats.errors);
                     for (const e of stats.errors) {
                         void appendDbLog(this.app, {
                             level: "error", source: "DB同步",

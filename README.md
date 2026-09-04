@@ -1,4 +1,4 @@
-# XDF-Base
+# XDF Base
 
 XDF 教学系统核心 Obsidian 插件：在 [QuickAdd](https://github.com/chhoumann/quickadd) 引擎之上扩展了新东方教学业务所需的脚本释放、Choice 同步、AI 调用与 SQLite 数据库能力。
 

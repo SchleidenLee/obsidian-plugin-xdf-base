@@ -792,7 +792,7 @@ export class QuickAddSettingsTab extends PluginSettingTab {
 			button.setButtonText("重新释放脚本").onClick(async () => {
 				const xdf = getXdfBaseInstance();
 				if (!xdf) {
-					new Notice("XDF-Base 尚未初始化");
+					new Notice("XDF Base 尚未初始化");
 					return;
 				}
 				button.setDisabled(true);

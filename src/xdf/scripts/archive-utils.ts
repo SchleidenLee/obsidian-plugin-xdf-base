@@ -60,7 +60,7 @@ const ISO_DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 function qa() {
     const plugins = app.plugins.plugins;
     const p = plugins["xdf-base"] || plugins.quickadd;
-    if (!p || !p.api) throw new Error("XDF-Base / QuickAdd 未加载");
+    if (!p || !p.api) throw new Error("XDF Base / QuickAdd 未加载");
     return p.api;
 }
 

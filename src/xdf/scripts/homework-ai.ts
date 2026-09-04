@@ -11,7 +11,7 @@ export const HOMEWORK_AI_SCRIPT = String.raw`module.exports = async (params) => 
 
         // 检查 AI 是否启用
         if (!quickAddApi.ai) {
-            new Notice("⚠️ AI 功能未启用，请在 XDF-Base 设置里检查");
+            new Notice("⚠️ AI 功能未启用，请在 XDF Base 设置里检查");
             return;
         }
 
